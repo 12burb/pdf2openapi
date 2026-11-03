@@ -127,7 +127,7 @@ def _clean_summary(text: str) -> str:
 
 
 def _is_toc(section: Section) -> bool:
-    return bool(re.search(r"\.{4,}\s*\d+\s*$", section.inline)) or len(section.lines) < 2
+    return bool(re.search(r"\.{4,}\s*\d+\s*$", section.inline)) or not section.lines
 
 
 def _heading_kind(line: str) -> str | None:
