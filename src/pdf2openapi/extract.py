@@ -12,7 +12,31 @@ from typing import Any
 from . import pdf, schema
 
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
-ENDPOINT_RE = re.compile(r"\b(" + "|".join(METHODS) + r")\s+(https?://[^\s/]+)?(/[\w\-./{}:<>~%]*)")
+ENDPOINT_RE = re.compile(
+    r"\b(" + "|".join(METHODS) + r")\s+(https?://[^\s/]+)?(/[\w\-./{}:<>~%$]*)(\?[^\s]*)?"
+)
+WRAPPED_PATH_RE = re.compile(r"(?:/|\{[^}]*|/v\d+(?:\.\d+)?)$")
+LABEL_RE = re.compile(
+    r"(?i)^(method|url|uri|endpoint|http request|request|response|example|sample request|"
+    r"syntax|description|api|resource|request line|definition)(\s+\w+)?\s*:?$"
+)
+NUMBERING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[A-Z]\.)\s+")
+HEADER_WORDS = {
+    "name": {
+        "name",
+        "parameter",
+        "parameter name",
+        "param",
+        "field",
+        "field name",
+        "attribute",
+        "property",
+        "key",
+        "element",
+    },
+    "type": {"type", "data type", "datatype", "format", "value type"},
+    "required": {"required", "mandatory", "optional", "req", "req.", "required?", "m/o"},
+}
 NAME_RE = re.compile(r"[A-Za-z_][\w\-]*(?:\[\])?(?:\.[A-Za-z_][\w\-]*(?:\[\])?)*")
 CELL_SPLIT_RE = re.compile(r"\s{3,}|\s*\|\s*|\t")
 INLINE_PARAM_RE = re.compile(
@@ -57,6 +81,7 @@ class Section:
     page: int
     inline: str
     before: str
+    query: list[str] = field(default_factory=list)
     lines: list[tuple[int, str]] = field(default_factory=list)
 
     @property
@@ -75,21 +100,71 @@ class ExtractResult:
 def normalize_path(raw: str) -> str:
     path = raw.split("?")[0].split("#")[0].rstrip(".,:;")
     path = re.sub(r"\{\{\s*(\w+)\s*\}\}", r"{\1}", path)
+    path = re.sub(r"\{\$(\w+)\}", r"{\1}", path)
     path = re.sub(r"/:(\w+)", r"/{\1}", path)
     path = re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", path)
     path = re.sub(r"/{2,}", "/", path)
+    path = re.sub(
+        r"\{([^}]*)\}", lambda m: "{" + (re.sub(r"\W+", "_", m.group(1)) or "id") + "}", path
+    )
     if len(path) > 1:
         path = path.rstrip("/")
     return path or "/"
 
 
 def _flat_lines(doc: pdf.Document) -> list[tuple[int, str]]:
-    return [
+    lines = [
         (page.number, line.rstrip())
         for page in doc.pages
         for line in page.full_text.splitlines()
         if line.strip()
     ]
+    return _join_wrapped_paths(lines)
+
+
+def _last_match(line: str) -> re.Match[str] | None:
+    matches = list(ENDPOINT_RE.finditer(line))
+    return matches[-1] if matches else None
+
+
+def _join_wrapped_paths(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Rejoin endpoint paths that the PDF wrapped onto the next line."""
+    out: list[tuple[int, str]] = []
+    i = 0
+    while i < len(lines):
+        page, line = lines[i]
+        m = _last_match(line)
+        while (
+            m
+            and i + 1 < len(lines)
+            and m.end() == len(line.rstrip())
+            and WRAPPED_PATH_RE.search(m.group(3))
+            and re.match(r"[/{$\w]", lines[i + 1][1].lstrip())
+            and not ENDPOINT_RE.search(lines[i + 1][1])
+        ):
+            nxt = lines[i + 1][1].strip()
+            head, sep, rest = nxt.partition("   ")
+            if not m.group(3).endswith(("/", "{")) and not head.startswith("/"):
+                break
+            line = line.rstrip() + head + (sep + rest if sep else "")
+            i += 1
+            m = _last_match(line)
+        out.append((page, line))
+        i += 1
+    return out
+
+
+def _title_before(lines: list[tuple[int, str]], i: int) -> str:
+    """The nearest short heading above an endpoint line, skipping labels like 'Method URL'."""
+    for j in range(i - 1, max(i - 4, -1), -1):
+        text = lines[j][1].strip()
+        if ENDPOINT_RE.search(text):
+            return ""
+        cells = [c for c in re.split(r"\s{3,}", text) if c]
+        if LABEL_RE.match(text) or all(LABEL_RE.match(c) for c in cells):
+            continue
+        return text if _is_heading_like(text) else ""
+    return ""
 
 
 def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
@@ -106,7 +181,12 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     host=m.group(2),
                     page=page,
                     inline=line[m.end() :],
-                    before=lines[i - 1][1] if i > 0 else "",
+                    before=_title_before(lines, i),
+                    query=[
+                        k
+                        for k in re.findall(r"[?&]([A-Za-z_][\w\-.]*)=", m.group(4) or "")
+                        if not k.startswith("_")
+                    ],
                 )
             )
         if not matches and sections:
@@ -122,6 +202,10 @@ def _is_heading_like(line: str) -> bool:
 
 def _clean_summary(text: str) -> str:
     text = re.sub(r"\.{3,}\s*\d*\s*$", "", text)
+    text = NUMBERING_RE.sub("", text)
+    text = CELL_SPLIT_RE.split(text.strip())[0] if text.strip() else ""
+    if re.match(r"(?i)https?://|[?&/]", text.strip()):
+        return ""
     text = text.strip(" \t-:|\u2013\u2014")
     return re.sub(r"\s{2,}", " ", text)
 
@@ -131,7 +215,7 @@ def _is_toc(section: Section) -> bool:
 
 
 def _heading_kind(line: str) -> str | None:
-    stripped = line.strip().rstrip(":")
+    stripped = NUMBERING_RE.sub("", line.strip()).rstrip(":")
     if len(stripped) > 40 or CELL_SPLIT_RE.search(stripped):
         return None
     for pattern, kind in HEADINGS:
@@ -140,8 +224,55 @@ def _heading_kind(line: str) -> str | None:
     return None
 
 
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in CELL_SPLIT_RE.split(line.strip()) if c.strip()]
+
+
+def _header_columns(line: str) -> dict[str, int] | None:
+    """Detect a parameter table header such as 'Parameter | Mandatory | Type | Description'."""
+    cells = [c.lower().strip(" :") for c in _cells(line)]
+    cols: dict[str, int] = {}
+    for idx, cell in enumerate(cells):
+        for role, words in HEADER_WORDS.items():
+            if cell in words and role not in cols:
+                cols[role] = idx
+    if "name" in cols and "type" in cols and len(cells) >= 2:
+        cols["count"] = len(cells)
+        return cols
+    return None
+
+
+def _requiredness(cell: str) -> bool | None:
+    word = cell.lower().strip(" .")
+    if word in REQUIRED_WORDS:
+        return True
+    if word in OPTIONAL_WORDS:
+        return False
+    return None
+
+
+def _parse_table_row(
+    line: str, cols: dict[str, int]
+) -> tuple[str, dict[str, Any], bool | None, str] | None:
+    cells = _cells(line)
+    if len(cells) <= max(cols["name"], cols["type"]):
+        return None
+    name = cells[cols["name"]].strip("`")
+    prop = schema.parse_type(cells[cols["type"]])
+    if not NAME_RE.fullmatch(name) or prop is None:
+        return None
+    required = None
+    if "required" in cols and cols["required"] < len(cells):
+        required = _requiredness(cells[cols["required"]])
+    used = {cols["name"], cols["type"], cols.get("required", -1)}
+    desc = " ".join(c for i, c in enumerate(cells) if i not in used)
+    if required is None:
+        required = _requiredness(cells[-1]) if len(cells) > 2 else None
+    return name, prop, required, desc
+
+
 def _parse_param_line(line: str) -> tuple[str, dict[str, Any], bool | None, str] | None:
-    cells = [c.strip() for c in CELL_SPLIT_RE.split(line.strip()) if c.strip()]
+    cells = _cells(line)
     if len(cells) >= 2 and NAME_RE.fullmatch(cells[0].strip("`")):
         prop = schema.parse_type(cells[1])
         if prop is not None:
@@ -150,6 +281,9 @@ def _parse_param_line(line: str) -> tuple[str, dict[str, Any], bool | None, str]
             if rest and rest[0].lower() in REQUIRED_WORDS | OPTIONAL_WORDS:
                 required = rest[0].lower() in REQUIRED_WORDS
                 rest = rest[1:]
+            if required is None and len(rest) > 1 and _requiredness(rest[-1]) is not None:
+                required = _requiredness(rest[-1])
+                rest = rest[:-1]
             desc = " ".join(rest)
             if required is None and re.search(r"(?i)\brequired\b", desc):
                 required = True
@@ -230,13 +364,24 @@ class _Builder:
         description: list[str] = []
         collecting_desc = True
 
+        columns: dict[str, int] | None = None
         for idx, line in enumerate(lines):
             for m in STATUS_RE.finditer(line):
                 statuses.setdefault(m.group(1), m.group(2).strip())
+            header = _header_columns(line)
+            if header:
+                columns = header
+                collecting_desc = False
+                continue
             kind = _heading_kind(line)
-            parsed = None if kind else _parse_param_line(line)
+            parsed = None
+            if not kind:
+                parsed = (_parse_table_row(line, columns) if columns else None) or (
+                    _parse_param_line(line)
+                )
             if kind:
                 context = kind
+                columns = None
                 heading_at[idx] = kind
                 collecting_desc = False
                 continue
@@ -267,6 +412,10 @@ class _Builder:
             ):
                 description.append(line.strip())
 
+        for name in sec.query:
+            params.setdefault(
+                ("query", name), {"name": name, "in": "query", "schema": {"type": "string"}}
+            )
         for name in path_params:
             params.setdefault(
                 ("path", name),
@@ -412,6 +561,9 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
     used_ids: set[str] = set()
     for (method, path), secs in grouped.items():
         main = [s for s in secs if not _is_toc(s)]
+        if re.fullmatch(r"/v\d+(?:\.\d+)?", path) and not any(len(s.lines) > 3 for s in secs):
+            warnings.append(f"{method} {path}: skipped; path looks cut off (page {secs[0].page})")
+            continue
         best = max(main or secs, key=lambda s: len(s.lines))
         op = builder.operation(best, method, path)
         if not op.get("summary"):

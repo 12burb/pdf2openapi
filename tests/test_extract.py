@@ -101,3 +101,43 @@ def test_no_endpoints_warns(tmp_path):
     result = extract(tmp_path / "x.pdf", ocr=False)
     assert result.spec["paths"] == {}
     assert any("no endpoints found" in w for w in result.warnings)
+
+
+def test_real_world_layouts(tmp_path):
+    """Patterns seen in real vendor PDFs: label rows, reordered columns, wrapped paths."""
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("2.2. SendSms")
+    b.row("Method", "URL")
+    b.line("POST   https://api.vendor.test/v1/SendSMS")
+    b.line("2.2.1   Parameters")
+    b.row("Parameter", "Mandatory", "Type", "Description")
+    b.row("toNumber", "Yes", "String", "Phone to send to")
+    b.row("text", "No", "String", "Message")
+    b.line("2.2.2   Responses")
+    b.row("Name", "Type", "Description")
+    b.row("status", "string", "Result")
+    b.line("Lookup a number")
+    b.line("GET /v1/AssignNumber?Number=xxx&format=json")
+    b.line("Download media")
+    b.line("GET /v1/media/{file.ext}/")
+    b.line("content")
+    path = b.save(tmp_path / "real.pdf")
+
+    spec = extract(path, ocr=False).spec
+    send = spec["paths"]["/v1/SendSMS"]["post"]
+    assert send["summary"] == "SendSms"
+    assert "parameters" not in send
+    body = send["requestBody"]["content"]["application/json"]["schema"]
+    assert flatten(body) == {
+        "toNumber": {"type": "string", "required": True},
+        "text": {"type": "string", "required": False},
+    }
+    resp = send["responses"]["200"]["content"]["application/json"]["schema"]
+    assert list(resp["properties"]) == ["status"]
+
+    lookup = spec["paths"]["/v1/AssignNumber"]["get"]
+    assert [p["name"] for p in lookup["parameters"]] == ["Number", "format"]
+    assert "/v1/media/{file_ext}/content" in spec["paths"]
+    assert validate_spec(spec)[0] == []
