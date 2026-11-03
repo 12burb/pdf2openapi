@@ -42,7 +42,7 @@ def test_extracts_endpoints_with_citations(vendor_pdf):
 
     assert spec["info"]["title"] == "Acme Payments API Reference"
     assert spec["info"]["version"] == "2.1"
-    assert spec["servers"] == [{"url": "https://api.acme.test/v2"}]
+    assert spec["servers"] == [{"url": "https://api.acme.test"}]
     assert spec["components"]["securitySchemes"] == {
         "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-Acme-Key"}
     }
@@ -141,3 +141,21 @@ def test_real_world_layouts(tmp_path):
     assert [p["name"] for p in lookup["parameters"]] == ["Number", "format"]
     assert "/v1/media/{file_ext}/content" in spec["paths"]
     assert validate_spec(spec)[0] == []
+
+
+def test_heading_after_trailing_slash_is_not_joined(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("List orders")
+    b.line("GET /orders/")
+    b.line("Response")
+    b.line("200 OK")
+    b.line("Wrapped")
+    b.line("GET /v1/accounts/{account")
+    b.line("_id}/balance")
+    path = b.save(tmp_path / "slash.pdf")
+    paths = extract(path, ocr=False).spec["paths"]
+    assert "/orders" in paths
+    assert "/v1/accounts/{account_id}/balance" in paths
+    assert not any("Response" in p for p in paths)

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import re
+import socket
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
@@ -16,6 +20,9 @@ from . import schema
 from .extract import extract
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_REDIRECTS = 5
+ALLOW_PRIVATE_ENV = "PDF2OPENAPI_ALLOW_PRIVATE_URLS"
 
 
 @dataclass
@@ -69,26 +76,73 @@ class DiffReport:
         return "\n".join(out).rstrip() + "\n"
 
 
-def load_spec(source: str, ocr: bool = True) -> dict[str, Any]:
+def _check_public_url(url: str) -> None:
+    """Refuse URLs that point at loopback, private, or link-local addresses."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"unsupported URL: {url}")
+    if os.environ.get(ALLOW_PRIVATE_ENV) == "1":
+        return
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"cannot resolve {parsed.hostname}: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError(
+                f"refusing to fetch {url}: {parsed.hostname} resolves to non-public address {ip} "
+                f"(set {ALLOW_PRIVATE_ENV}=1 to allow)"
+            )
+
+
+def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
+    """Download a document, checking every redirect hop and capping the size."""
+    with httpx.Client(timeout=60, transport=transport) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            if transport is None:
+                _check_public_url(url)
+            with client.stream("GET", url) as resp:
+                if resp.is_redirect:
+                    url = urljoin(url, resp.headers["location"])
+                    continue
+                resp.raise_for_status()
+                chunks, size = [], 0
+                for chunk in resp.iter_bytes():
+                    size += len(chunk)
+                    if size > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(f"{url} is larger than {MAX_DOWNLOAD_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    raise ValueError(f"too many redirects fetching {url}")
+
+
+def _parse_spec_text(text: str, source: str, is_json: bool) -> dict[str, Any]:
+    data = json.loads(text) if is_json else yaml.safe_load(text)
+    if not isinstance(data, dict) or "paths" not in data:
+        raise ValueError(f"{source} is not an OpenAPI document")
+    return data
+
+
+def load_spec(
+    source: str, ocr: bool = True, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
     """Load an OpenAPI spec from a .pdf/.yaml/.json path or http(s) URL."""
     if re.match(r"https?://", source):
-        resp = httpx.get(source, follow_redirects=True, timeout=60)
-        resp.raise_for_status()
-        is_pdf = resp.content[:5] == b"%PDF-"
-        suffix = ".pdf" if is_pdf else Path(source.split("?")[0]).suffix or ".yaml"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
-            fh.write(resp.content)
-        source = fh.name
+        content = fetch_url(source, transport=transport)
+        if content[:5] == b"%PDF-":
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "download.pdf"
+                path.write_bytes(content)
+                return extract(path, ocr=ocr).spec
+        text = content.decode("utf-8")
+        return _parse_spec_text(text, source, text.lstrip().startswith(("{", "[")))
     path = Path(source)
     with open(path, "rb") as fh:
         head = fh.read(5)
     if head == b"%PDF-":
         return extract(path, ocr=ocr).spec
-    text = path.read_text(encoding="utf-8")
-    data = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
-    if not isinstance(data, dict) or "paths" not in data:
-        raise ValueError(f"{source} is not an OpenAPI document")
-    return data
+    return _parse_spec_text(path.read_text(encoding="utf-8"), source, path.suffix == ".json")
 
 
 def _operations(spec: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
@@ -121,8 +175,16 @@ def _json_schema(container: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _body_fields(op: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    flat = schema.flatten(_json_schema(op.get("requestBody")))
-    return {f"body field '{k}'": v for k, v in flat.items()}
+    body = op.get("requestBody")
+    if not isinstance(body, dict):
+        return {}
+    root = _json_schema(body)
+    out = {
+        "request body": {"type": schema.describe_type(root), "required": bool(body.get("required"))}
+    }
+    flat = schema.flatten(root)
+    out.update({f"body field '{k}'": v for k, v in flat.items()})
+    return out
 
 
 def _success_response(op: dict[str, Any]) -> dict[str, Any]:
@@ -136,7 +198,7 @@ def _success_response(op: dict[str, Any]) -> dict[str, Any]:
 def _compare_inputs(endpoint: str, old: dict, new: dict, changes: list[Change]) -> None:
     for name in sorted(set(old) | set(new)):
         if name not in new:
-            changes.append(Change(endpoint, f"{name} removed", False))
+            changes.append(Change(endpoint, f"{name} removed", True))
         elif name not in old:
             req = new[name]["required"]
             changes.append(
@@ -159,8 +221,14 @@ def _compare_outputs(endpoint: str, old_op: dict, new_op: dict, changes: list[Ch
         changes.append(Change(endpoint, f"response {code} removed", code.startswith("2")))
     for code in sorted(new_codes - old_codes):
         changes.append(Change(endpoint, f"response {code} added", False))
-    old_fields = schema.flatten(_json_schema(_success_response(old_op)))
-    new_fields = schema.flatten(_json_schema(_success_response(new_op)))
+    old_root = _json_schema(_success_response(old_op))
+    new_root = _json_schema(_success_response(new_op))
+    if old_root and new_root:
+        o, n = schema.describe_type(old_root), schema.describe_type(new_root)
+        if o != n:
+            changes.append(Change(endpoint, f"response body type {o} -> {n}", True))
+    old_fields = schema.flatten(old_root)
+    new_fields = schema.flatten(new_root)
     for name in sorted(set(old_fields) | set(new_fields)):
         if name not in new_fields:
             changes.append(Change(endpoint, f"response field '{name}' removed", True))
@@ -169,6 +237,33 @@ def _compare_outputs(endpoint: str, old_op: dict, new_op: dict, changes: list[Ch
         elif old_fields[name]["type"] != new_fields[name]["type"]:
             o, n = old_fields[name]["type"], new_fields[name]["type"]
             changes.append(Change(endpoint, f"response field '{name}' type {o} -> {n}", True))
+        elif old_fields[name]["required"] and not new_fields[name]["required"]:
+            changes.append(Change(endpoint, f"response field '{name}' is now optional", True))
+
+
+def _security_names(requirements: Any) -> list[list[str]]:
+    return sorted(sorted(r) for r in requirements or [] if isinstance(r, dict))
+
+
+def _compare_security(old: dict[str, Any], new: dict[str, Any], changes: list[Change]) -> None:
+    old_schemes = (old.get("components") or {}).get("securitySchemes") or {}
+    new_schemes = (new.get("components") or {}).get("securitySchemes") or {}
+    if set(old_schemes) != set(new_schemes):
+        changes.append(
+            Change(
+                "(global)",
+                f"auth schemes {sorted(old_schemes)} -> {sorted(new_schemes)}",
+                True,
+            )
+        )
+    for name in sorted(set(old_schemes) & set(new_schemes)):
+        if old_schemes[name] != new_schemes[name]:
+            o = json.dumps(old_schemes[name], sort_keys=True)
+            n = json.dumps(new_schemes[name], sort_keys=True)
+            changes.append(Change("(global)", f"auth scheme '{name}' changed: {o} -> {n}", True))
+    o, n = _security_names(old.get("security")), _security_names(new.get("security"))
+    if o != n:
+        changes.append(Change("(global)", f"required auth {o} -> {n}", True))
 
 
 def diff_specs(old: dict[str, Any], new: dict[str, Any]) -> DiffReport:
@@ -186,13 +281,13 @@ def diff_specs(old: dict[str, Any], new: dict[str, Any]) -> DiffReport:
         _compare_inputs(label, _params(old_op), _params(new_op), report.changes)
         _compare_inputs(label, _body_fields(old_op), _body_fields(new_op), report.changes)
         _compare_outputs(label, old_op, new_op, report.changes)
+        if "security" in old_op or "security" in new_op:
+            o = _security_names(old_op.get("security", old.get("security")))
+            n = _security_names(new_op.get("security", new.get("security")))
+            if o != n:
+                report.changes.append(Change(label, f"required auth {o} -> {n}", True))
 
-    old_auth = set((old.get("components") or {}).get("securitySchemes") or {})
-    new_auth = set((new.get("components") or {}).get("securitySchemes") or {})
-    if old_auth != new_auth:
-        report.changes.append(
-            Change("(global)", f"auth schemes {sorted(old_auth)} -> {sorted(new_auth)}", True)
-        )
+    _compare_security(old, new, report.changes)
     old_servers = [s.get("url") for s in old.get("servers") or []]
     new_servers = [s.get("url") for s in new.get("servers") or []]
     if old_servers != new_servers:

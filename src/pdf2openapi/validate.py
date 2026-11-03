@@ -59,6 +59,11 @@ def probe(
                 if method not in SAFE_METHODS or not isinstance(op, dict):
                     continue
                 key = f"{method.upper()} {path}"
+                if not _is_relative_path(path):
+                    results.append(
+                        ProbeResult(key, None, "skipped (path is not relative to base URL)")
+                    )
+                    continue
                 needs_input = "{" in path or any(
                     p.get("required") for p in op.get("parameters") or [] if p.get("in") != "header"
                 )
@@ -72,6 +77,15 @@ def probe(
                     continue
                 results.append(ProbeResult(key, resp.status_code, _verdict(resp.status_code, op)))
     return results
+
+
+def _is_relative_path(path: str) -> bool:
+    return (
+        path.startswith("/")
+        and not path.startswith("//")
+        and "://" not in path
+        and "\\" not in path
+    )
 
 
 def _verdict(status: int, op: dict[str, Any]) -> str:
