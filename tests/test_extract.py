@@ -159,3 +159,29 @@ def test_heading_after_trailing_slash_is_not_joined(tmp_path):
     assert "/orders" in paths
     assert "/v1/accounts/{account_id}/balance" in paths
     assert not any("Response" in p for p in paths)
+
+
+def test_method_and_url_on_separate_lines(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("Get PAR URL")
+    b.line("- Method: GET")
+    b.line("- Path: /objectstore/getParURL")
+    b.row("Parameter", "Value Type", "Description")
+    b.row("filename", "String", "File name")
+    b.line("Payment request")
+    b.line("API URL")
+    b.line("https://tt.pay.test/plugins/payments/request")
+    b.line("HTTP")
+    b.line("POST")
+    b.row("Name", "Type", "Required")
+    b.row("total", "number", "Yes")
+    path = b.save(tmp_path / "split.pdf")
+    spec = extract(path, ocr=False).spec
+    assert [p["name"] for p in spec["paths"]["/objectstore/getParURL"]["get"]["parameters"]] == [
+        "filename"
+    ]
+    post = spec["paths"]["/plugins/payments/request"]["post"]
+    assert "total" in post["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert {"url": "https://tt.pay.test"} in spec["servers"]

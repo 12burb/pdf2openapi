@@ -119,7 +119,79 @@ def _flat_lines(doc: pdf.Document) -> list[tuple[int, str]]:
         for line in page.full_text.splitlines()
         if line.strip()
     ]
-    return _join_wrapped_paths(lines)
+    return _split_endpoints(_join_wrapped_paths(lines))
+
+
+_METHOD_ALT = "|".join(METHODS)
+METHOD_LABEL_RE = re.compile(
+    r"(?i)^\W*(?:http\s+|request\s+)?(?:method|verb)\s*[:\-|]?\s*(" + _METHOD_ALT + r")\b"
+)
+BARE_METHOD_RE = re.compile(r"^\W*(" + _METHOD_ALT + r")\W*$")
+METHOD_LABEL_LINE_RE = re.compile(
+    r"(?i)^\W*(?:http|https|http\s+method|method|verb|request method)\W*$"
+)
+URL_LABEL_RE = re.compile(
+    r"(?i)^\W*(?:path|uri|url|endpoint|resource(?:\s+url)?|api\s+url|request\s+url|"
+    r"service\s+url)\s*[:\-|]?\s*((?:https?://[^\s/]+)?/[\w\-./{}:<>~%$?=&]*)\s*$"
+)
+BARE_URL_RE = re.compile(r"^\W*((?:https?://[^\s/]+)?/[\w\-./{}:<>~%$?=&]*[\w}/])\s*$")
+URL_LABEL_LINE_RE = re.compile(
+    r"(?i)^\W*(?:path|uri|url|endpoint|resource(?:\s+url)?|api\s+url|request\s+url)\W*$"
+)
+
+
+def _split_method(lines: list[tuple[int, str]], i: int) -> str | None:
+    text = lines[i][1].strip()
+    m = METHOD_LABEL_RE.match(text)
+    if m:
+        return m.group(1).upper()
+    m = BARE_METHOD_RE.match(text)
+    if m and i > 0 and METHOD_LABEL_LINE_RE.match(lines[i - 1][1].strip()):
+        return m.group(1).upper()
+    return None
+
+
+def _split_url(lines: list[tuple[int, str]], j: int) -> str | None:
+    text = lines[j][1].strip()
+    m = URL_LABEL_RE.match(text)
+    if m:
+        return m.group(1)
+    m = BARE_URL_RE.match(text)
+    if m and "/" in m.group(1).split("://")[-1].strip("/"):
+        near = lines[max(0, j - 3) : j] + lines[j + 1 : j + 3]
+        if any(URL_LABEL_LINE_RE.match(t.strip()) for _, t in near):
+            return m.group(1)
+    return None
+
+
+def _split_endpoints(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Find endpoints whose method and URL sit on separate lines ('Method: GET' / 'Path: /x')."""
+    inserts: dict[int, str] = {}
+    seen: dict[str, int] = {}
+    for i in range(len(lines)):
+        method = _split_method(lines, i)
+        if not method:
+            continue
+        window = range(max(0, i - 4), min(len(lines), i + 5))
+        if any(ENDPOINT_RE.search(lines[j][1]) for j in window):
+            continue
+        for j in sorted(window, key=lambda j: abs(j - i)):
+            url = _split_url(lines, j) if j != i else None
+            if not url:
+                continue
+            key = f"{method} {url}"
+            if i - seen.get(key, -100) > 15:
+                inserts[min(i, j)] = key
+                seen[key] = i
+            break
+    if not inserts:
+        return lines
+    out: list[tuple[int, str]] = []
+    for idx, item in enumerate(lines):
+        if idx in inserts:
+            out.append((item[0], inserts[idx]))
+        out.append(item)
+    return out
 
 
 def _last_match(line: str) -> re.Match[str] | None:
@@ -182,16 +254,29 @@ def _strip_server_prefixes(servers: list[str], paths: list[str]) -> list[str]:
 
 
 def _title_before(lines: list[tuple[int, str]], i: int) -> str:
-    """The nearest short heading above an endpoint line, skipping labels like 'Method URL'."""
-    for j in range(i - 1, max(i - 4, -1), -1):
-        text = lines[j][1].strip()
-        if ENDPOINT_RE.search(text):
-            return ""
+    """The nearest heading above an endpoint line, skipping labels like 'Method URL'.
+
+    A numbered heading ("2.3 ListMyNumbers") a few lines up wins over a closer unnumbered line,
+    which is often a one-sentence description.
+    """
+    fallback = ""
+    for j in range(i - 1, max(i - 7, -1), -1):
+        raw = lines[j][1].strip()
+        if ENDPOINT_RE.search(raw):
+            break
+        text = NUMBERING_RE.sub("", raw)
         cells = [c for c in re.split(r"\s{3,}", text) if c]
-        if LABEL_RE.match(text) or all(LABEL_RE.match(c) for c in cells):
+        if not cells or LABEL_RE.match(text) or all(LABEL_RE.match(c) for c in cells):
             continue
-        return text if _is_heading_like(text) else ""
-    return ""
+        if not _is_heading_like(raw):
+            if fallback or j < i - 3:
+                break
+            continue
+        if NUMBERING_RE.match(raw) and len(cells) == 1:
+            return raw
+        if not fallback and j >= i - 3:
+            fallback = raw
+    return fallback
 
 
 def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
