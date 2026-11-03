@@ -182,3 +182,42 @@ def test_load_spec_url_follows_redirect_and_cleans_up(vendor_pdf, tmp_path, monk
     spec = load_spec("https://vendor.test/old", ocr=False, transport=httpx.MockTransport(handler))
     assert "/v2/orders" in spec["paths"]
     assert list(tmpdir.iterdir()) == []
+
+
+def test_diff_oauth_scope_change_is_breaking():
+    old = {"security": [{"oauth": ["read"]}], "paths": {}}
+    new = {"security": [{"oauth": ["write"]}], "paths": {}}
+    report = diff_specs(old, new)
+    assert any("oauth[read]" in c.detail and c.breaking for c in report.changes)
+
+
+def test_fetch_pins_checked_ip(monkeypatch):
+    import socket
+
+    from pdf2openapi.diff import _request_target
+
+    monkeypatch.delenv("PDF2OPENAPI_ALLOW_PRIVATE_URLS", raising=False)
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))]
+    )
+    url, headers, ext = _request_target("https://u:p@docs.vendor.com:8443/a.pdf", pin=True)
+    assert url == "https://93.184.216.34:8443/a.pdf"
+    assert headers == {"Host": "docs.vendor.com:8443"}
+    assert ext == {"sni_hostname": "docs.vendor.com"}
+
+
+def test_fetch_credentials_not_sent_to_redirect_target():
+    from pdf2openapi.diff import fetch_url
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.host, request.headers.get("authorization")))
+        if request.url.host == "docs.vendor.test":
+            return httpx.Response(302, headers={"location": "https://cdn.other.test/a.pdf"})
+        return httpx.Response(200, content=b"ok")
+
+    body = fetch_url("https://me:pw@docs.vendor.test/a.pdf", transport=httpx.MockTransport(handler))
+    assert body == b"ok"
+    assert seen[0][0] == "docs.vendor.test" and seen[0][1].startswith("Basic ")
+    assert seen[1] == ("cdn.other.test", None)

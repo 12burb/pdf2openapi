@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 import yaml
@@ -76,35 +76,85 @@ class DiffReport:
         return "\n".join(out).rstrip() + "\n"
 
 
-def _check_public_url(url: str) -> None:
-    """Refuse URLs that point at loopback, private, or link-local addresses."""
+def _check_public_url(url: str) -> str | None:
+    """Refuse URLs that point at loopback, private, or link-local addresses.
+
+    Returns the checked IP address so the request can connect to exactly that address (a second
+    DNS lookup could return a private one), or None when private URLs are allowed.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(f"unsupported URL: {url}")
     if os.environ.get(ALLOW_PRIVATE_ENV) == "1":
-        return
+        return None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError(f"cannot resolve {parsed.hostname}: {exc}") from exc
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+    ips = [ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos]
+    for ip in ips:
         if not ip.is_global:
             raise ValueError(
                 f"refusing to fetch {url}: {parsed.hostname} resolves to non-public address {ip} "
                 f"(set {ALLOW_PRIVATE_ENV}=1 to allow)"
             )
+    if not ips:
+        raise ValueError(f"cannot resolve {parsed.hostname}")
+    return str(ips[0])
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme,
+        parsed.hostname or "",
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    )
+
+
+def _request_target(url: str, pin: bool) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """URL to request (credentials removed, host pinned to the checked IP), headers, extensions."""
+    parsed = urlparse(url)
+    host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname or ""
+    hostport = host + (f":{parsed.port}" if parsed.port else "")
+    headers: dict[str, str] = {}
+    extensions: dict[str, Any] = {}
+    netloc = hostport
+    ip = _check_public_url(url) if pin else None
+    if ip:
+        netloc = (f"[{ip}]" if ":" in ip else ip) + (f":{parsed.port}" if parsed.port else "")
+        headers["Host"] = hostport
+        if parsed.scheme == "https":
+            extensions["sni_hostname"] = parsed.hostname
+    return parsed._replace(netloc=netloc).geturl(), headers, extensions
 
 
 def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
-    """Download a document, checking every redirect hop and capping the size."""
-    with httpx.Client(timeout=60, transport=transport) as client:
+    """Download a document, checking every redirect hop and capping the size.
+
+    Credentials in the URL are only sent to that URL's own origin, never to redirect targets.
+    """
+    parsed = urlparse(url)
+    home = _origin(url)
+    auth = None
+    if parsed.username is not None:
+        auth = httpx.BasicAuth(unquote(parsed.username), unquote(parsed.password or ""))
+    with httpx.Client(timeout=60, transport=transport, trust_env=transport is None) as client:
         for _ in range(MAX_REDIRECTS + 1):
-            if transport is None:
-                _check_public_url(url)
-            with client.stream("GET", url) as resp:
+            target, headers, extensions = _request_target(url, pin=transport is None)
+            request = client.build_request("GET", target, headers=headers, extensions=extensions)
+            if auth and _origin(url) == home:
+                request = next(auth.auth_flow(request))
+            resp = client.send(request, stream=True)
+            try:
                 if resp.is_redirect:
-                    url = urljoin(url, resp.headers["location"])
+                    location = urljoin(url, resp.headers["location"])
+                    url = (
+                        urlparse(location)
+                        ._replace(netloc=urlparse(location).netloc.rpartition("@")[2])
+                        .geturl()
+                    )
                     continue
                 resp.raise_for_status()
                 chunks, size = [], 0
@@ -114,6 +164,8 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
                         raise ValueError(f"{url} is larger than {MAX_DOWNLOAD_BYTES} bytes")
                     chunks.append(chunk)
                 return b"".join(chunks)
+            finally:
+                resp.close()
     raise ValueError(f"too many redirects fetching {url}")
 
 
@@ -241,8 +293,17 @@ def _compare_outputs(endpoint: str, old_op: dict, new_op: dict, changes: list[Ch
             changes.append(Change(endpoint, f"response field '{name}' is now optional", True))
 
 
-def _security_names(requirements: Any) -> list[list[str]]:
-    return sorted(sorted(r) for r in requirements or [] if isinstance(r, dict))
+def _security_names(requirements: Any) -> list[str]:
+    """Canonical security requirements: alternatives (OR) of schemes with scopes (AND)."""
+    out = []
+    for req in requirements or []:
+        if isinstance(req, dict):
+            parts = [
+                f"{name}[{','.join(sorted(scopes))}]" if scopes else name
+                for name, scopes in sorted(req.items())
+            ]
+            out.append(" + ".join(parts))
+    return sorted(out)
 
 
 def _compare_security(old: dict[str, Any], new: dict[str, Any], changes: list[Change]) -> None:
