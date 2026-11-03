@@ -114,10 +114,15 @@ jobs:
 
 A failing run means the PDF changed. The log shows what changed and which changes break clients.
 
+URLs must resolve to public addresses (each redirect is checked; at most 5 redirects and
+100 MB). To diff a document on a private network, set `PDF2OPENAPI_ALLOW_PRIVATE_URLS=1`.
+
 ## Limitations
 
-- Endpoints are found by lines that look like `POST /v1/orders`. Docs that never write the
-  method and path together need `--ai`.
+- Endpoints are found by lines like `POST /v1/orders`, or by a method and URL on separate
+  lines (`Method: GET` / `Path: /orders`). When a doc labels a URI but never states the
+  method, the method is guessed and the operation is marked `x-method-guessed: true`.
+  Docs that only describe endpoints in prose need `--ai`.
 - Tables are rebuilt from text positions. Unusual layouts may lose columns. Check the
   `warning:` lines and `x-source-pages`.
 - OCR quality depends on screenshot resolution.

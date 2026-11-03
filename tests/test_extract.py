@@ -185,3 +185,40 @@ def test_method_and_url_on_separate_lines(tmp_path):
     post = spec["paths"]["/plugins/payments/request"]["post"]
     assert "total" in post["requestBody"]["content"]["application/json"]["schema"]["properties"]
     assert {"url": "https://tt.pay.test"} in spec["servers"]
+
+
+def test_uri_without_method_is_guessed(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("4.1.1 All Active Bids Report")
+    b.line("4.1.1.2.1 URI to access the Web API")
+    b.line("/api-AllActiveBidsReport/v1")
+    b.line("4.1.1.3.1 API Request Parameters")
+    b.row("Name", "Type", "Required")
+    b.row("gasDay", "date", "Yes")
+    path = b.save(tmp_path / "guess.pdf")
+    result = extract(path, ocr=False)
+    op = result.spec["paths"]["/api-AllActiveBidsReport/v1"]["post"]
+    assert op["x-method-guessed"] is True
+    assert any("guessed" in w for w in result.warnings)
+
+
+def test_xsd_table_rows_become_body_fields(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("4.1.1 All Active Bids Report")
+    b.line("URI to access the Web API")
+    b.line("/api-AllActiveBidsReport/v1")
+    b.line("API Request Parameters")
+    b.row("xml", "json")
+    b.row("1", "MOS", "xs:string", "Yes")
+    b.row("1", "GAS_DAY", "xs:date", "No")
+    path = b.save(tmp_path / "xsd.pdf")
+    op = extract(path, ocr=False).spec["paths"]["/api-AllActiveBidsReport/v1"]["post"]
+    body = op["requestBody"]["content"]["application/json"]["schema"]
+    assert body["properties"]["GAS_DAY"]["format"] == "date"
+    assert set(body["properties"]) == {"MOS", "GAS_DAY"}
+    assert body["required"] == ["MOS"]
+    assert op["summary"] == "All Active Bids Report"

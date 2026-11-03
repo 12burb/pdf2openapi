@@ -83,6 +83,7 @@ class Section:
     before: str
     query: list[str] = field(default_factory=list)
     lines: list[tuple[int, str]] = field(default_factory=list)
+    method_guessed: bool = False
 
     @property
     def text(self) -> str:
@@ -136,8 +137,11 @@ URL_LABEL_RE = re.compile(
 )
 BARE_URL_RE = re.compile(r"^\W*((?:https?://[^\s/]+)?/[\w\-./{}:<>~%$?=&]*[\w}/])\s*$")
 URL_LABEL_LINE_RE = re.compile(
-    r"(?i)^\W*(?:path|uri|url|endpoint|resource(?:\s+url)?|api\s+url|request\s+url)\W*$"
+    r"(?i)^\W*(?:path|uri|url|endpoint|resource(?:\s+url)?|api\s+url|request\s+url)"
+    r"(?:\s+(?:to|for|of)\b[^.]{0,40})?\W*$"
 )
+GUESSED_MARK = "   [method not stated]"
+MAX_SECTION_PAGES = 3
 
 
 def _split_method(lines: list[tuple[int, str]], i: int) -> str | None:
@@ -152,14 +156,14 @@ def _split_method(lines: list[tuple[int, str]], i: int) -> str | None:
 
 
 def _split_url(lines: list[tuple[int, str]], j: int) -> str | None:
-    text = lines[j][1].strip()
+    text = NUMBERING_RE.sub("", lines[j][1].strip())
     m = URL_LABEL_RE.match(text)
     if m:
         return m.group(1)
     m = BARE_URL_RE.match(text)
     if m and "/" in m.group(1).split("://")[-1].strip("/"):
         near = lines[max(0, j - 3) : j] + lines[j + 1 : j + 3]
-        if any(URL_LABEL_LINE_RE.match(t.strip()) for _, t in near):
+        if any(URL_LABEL_LINE_RE.match(NUMBERING_RE.sub("", t.strip())) for _, t in near):
             return m.group(1)
     return None
 
@@ -184,6 +188,27 @@ def _split_endpoints(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
                 inserts[min(i, j)] = key
                 seen[key] = i
             break
+    used = {k.split(" ", 1)[1] for k in inserts.values()}
+    for j in range(len(lines)):
+        text = NUMBERING_RE.sub("", lines[j][1].strip())
+        m = URL_LABEL_RE.match(text)
+        url = m.group(1) if m else None
+        if (
+            not url
+            and j > 0
+            and URL_LABEL_LINE_RE.match(NUMBERING_RE.sub("", lines[j - 1][1].strip()))
+        ):
+            b = BARE_URL_RE.match(text)
+            url = b.group(1) if b and "/" in b.group(1).split("://")[-1].strip("/") else None
+        if not url or url in used or ENDPOINT_RE.search(lines[j][1]):
+            continue
+        window = range(max(0, j - 4), min(len(lines), j + 5))
+        if any(ENDPOINT_RE.search(lines[k][1]) or _split_method(lines, k) for k in window):
+            continue
+        ahead = " ".join(t for _, t in lines[j + 1 : j + 40])
+        method = "POST" if re.search(r"(?i)request\s+(body|payload|parameters)", ahead) else "GET"
+        inserts.setdefault(j, f"{method} {url}{GUESSED_MARK}")
+        used.add(url)
     if not inserts:
         return lines
     out: list[tuple[int, str]] = []
@@ -266,6 +291,8 @@ def _title_before(lines: list[tuple[int, str]], i: int) -> str:
             break
         text = NUMBERING_RE.sub("", raw)
         cells = [c for c in re.split(r"\s{3,}", text) if c]
+        if URL_LABEL_LINE_RE.match(text) or re.fullmatch(r"(?i)(api\s+)?ur[il]s?", text):
+            continue
         if not cells or LABEL_RE.match(text) or all(LABEL_RE.match(c) for c in cells):
             continue
         if not _is_heading_like(raw):
@@ -286,13 +313,15 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
         if matches and sections and sections[-1].lines and _is_heading_like(lines[i - 1][1]):
             sections[-1].lines.pop()
         for m in matches:
+            guessed = line.endswith(GUESSED_MARK)
             sections.append(
                 Section(
                     method=m.group(1),
                     path=normalize_path(m.group(3)),
                     host=m.group(2),
                     page=page,
-                    inline=line[m.end() :],
+                    inline=line[m.end() :].removesuffix(GUESSED_MARK),
+                    method_guessed=guessed,
                     before=_title_before(lines, i),
                     query=[
                         k
@@ -301,7 +330,7 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     ],
                 )
             )
-        if not matches and sections:
+        if not matches and sections and page - sections[-1].page < MAX_SECTION_PAGES:
             sections[-1].lines.append((page, line))
     return sections
 
@@ -383,8 +412,50 @@ def _parse_table_row(
     return name, prop, required, desc
 
 
+XSD_ROW_RE = re.compile(r"^\s*\d+\s{2,}([A-Za-z][\w]*)\s{2,}(.*?)\bxs:(\w+)(.*)$")
+XSD_TYPES = {
+    "string": {"type": "string"},
+    "date": {"type": "string", "format": "date"},
+    "datetime": {"type": "string", "format": "date-time"},
+    "boolean": {"type": "boolean"},
+    "decimal": {"type": "number"},
+    "double": {"type": "number"},
+    "float": {"type": "number"},
+}
+
+
+def _parse_xsd_row(line: str) -> tuple[str, dict[str, Any], bool | None, str] | None:
+    """Rows of XML-schema tables: 'level  ELEMENT  Description  xs:type  len  min  max  Yes'."""
+    m = XSD_ROW_RE.match(line)
+    if not m:
+        return None
+    xs = m.group(3).lower()
+    prop = dict(
+        XSD_TYPES.get(xs)
+        or ({"type": "integer"} if "int" in xs or xs in ("long", "short") else {"type": "string"})
+    )
+    req = re.search(r"\s(Yes|No|Y|N)\b", m.group(4))
+    required = req.group(1).lower().startswith("y") if req else None
+    return m.group(1), prop, required, m.group(2).strip()
+
+
+def _humanize_path(path: str) -> str:
+    segs = [s for s in path.strip("/").split("/") if s and not s.startswith("{")]
+    segs = [s for s in segs if not re.fullmatch(r"v\d+(\.\d+)*|api", s, re.I)]
+    if not segs:
+        return ""
+    word = re.sub(r"^api[-_]", "", segs[-1], flags=re.I)
+    word = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|[-_.]+", " ", word).strip()
+    return word[:1].upper() + word[1:]
+
+
 def _parse_param_line(line: str) -> tuple[str, dict[str, Any], bool | None, str] | None:
+    xsd = _parse_xsd_row(line)
+    if xsd:
+        return xsd
     cells = _cells(line)
+    if [c.lower() for c in cells] in (["xml", "json"], ["json", "xml"]):
+        return None
     if len(cells) >= 2 and NAME_RE.fullmatch(cells[0].strip("`")):
         prop = schema.parse_type(cells[1])
         if prop is not None:
@@ -501,6 +572,9 @@ class _Builder:
                 collecting_desc = False
                 name, prop, required, desc = parsed
                 where = self._location(context, name, method, path_params)
+                if where == "query" and method not in ("GET", "HEAD", "DELETE"):
+                    if _parse_xsd_row(line):
+                        where = "body"
                 if desc:
                     prop["description"] = desc
                 if where == "response":
@@ -550,6 +624,8 @@ class _Builder:
 
         op: dict[str, Any] = {}
         summary = _clean_summary(sec.inline) or self._summary_from_before(sec.before)
+        if not summary and sec.method_guessed:
+            summary = _humanize_path(path)
         if summary:
             op["summary"] = summary
         if description:
@@ -650,6 +726,7 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
     lines = _flat_lines(doc)
     full_text = "\n".join(line for _, line in lines)
     warnings: list[str] = []
+    guessed: list[str] = []
 
     schemes, auth_headers = _security(full_text)
     builder = _Builder(auth_headers)
@@ -678,6 +755,9 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
             continue
         best = max(main or secs, key=lambda s: len(s.lines))
         op = builder.operation(best, method, path)
+        if all(s.method_guessed for s in secs):
+            op["x-method-guessed"] = True
+            guessed.append(f"{method} {path}")
         if not op.get("summary"):
             for s in secs:
                 summary = _clean_summary(s.inline) or builder._summary_from_before(s.before)
@@ -727,6 +807,14 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
     if schemes:
         spec["components"] = {"securitySchemes": schemes}
         spec["security"] = [{name: []} for name in schemes]
+    if guessed:
+        shown = ", ".join(guessed[:3]) + (
+            f" and {len(guessed) - 3} more" if len(guessed) > 3 else ""
+        )
+        warnings.append(
+            f"HTTP method not stated near the URL for {len(guessed)} operation(s); guessed "
+            f"(marked x-method-guessed): {shown}"
+        )
     return ExtractResult(spec=spec, warnings=warnings, sections=sections_text, document=doc)
 
 
