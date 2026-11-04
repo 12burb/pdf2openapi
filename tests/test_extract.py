@@ -222,3 +222,61 @@ def test_xsd_table_rows_become_body_fields(tmp_path):
     assert set(body["properties"]) == {"MOS", "GAS_DAY"}
     assert body["required"] == ["MOS"]
     assert op["summary"] == "All Active Bids Report"
+
+
+def _ops(spec):
+    return sorted(f"{m.upper()} {p}" for p, item in spec["paths"].items() for m in item)
+
+
+def test_split_endpoint_next_to_complete_endpoint(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("GET /a")
+    b.line("Method: POST")
+    b.line("Path: /b")
+    spec = extract(b.save(tmp_path / "mixed.pdf"), ocr=False).spec
+    assert _ops(spec) == ["GET /a", "POST /b"]
+
+
+def test_adjacent_split_endpoints_keep_their_own_paths(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("Method: GET")
+    b.line("Path: /a")
+    b.line("Method: POST")
+    b.line("Path: /b")
+    b.line("Path: /c")
+    b.line("Method: PUT")
+    spec = extract(b.save(tmp_path / "adjacent.pdf"), ocr=False).spec
+    assert _ops(spec) == ["GET /a", "POST /b", "PUT /c"]
+
+
+def test_long_section_keeps_later_pages(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("2.1 Create order")
+    b.line("POST /orders")
+    for _ in range(3):
+        b.new_page()
+        b.line("Notes about orders")
+    b.line("201 Created")
+    b.new_page()
+    b.line("3 Appendix")
+    b.line("404 Not Found")
+    spec = extract(b.save(tmp_path / "long.pdf"), ocr=False).spec
+    assert set(spec["paths"]["/orders"]["post"]["responses"]) == {"201"}
+
+
+def test_mixed_server_prefix_paths(tmp_path):
+    from conftest import PdfBuilder
+
+    b = PdfBuilder().new_page()
+    b.line("Base URL: https://api.test/v2")
+    b.line("GET /v2/orders")
+    b.line("GET /health")
+    spec = extract(b.save(tmp_path / "prefix.pdf"), ocr=False).spec
+    assert spec["servers"] == [{"url": "https://api.test/v2"}]
+    assert _ops(spec) == ["GET /health", "GET /orders"]

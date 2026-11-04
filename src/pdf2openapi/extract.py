@@ -84,6 +84,9 @@ class Section:
     query: list[str] = field(default_factory=list)
     lines: list[tuple[int, str]] = field(default_factory=list)
     method_guessed: bool = False
+    depth: int | None = None
+    closed: bool = False
+    truncated: bool = False
 
     @property
     def text(self) -> str:
@@ -141,7 +144,8 @@ URL_LABEL_LINE_RE = re.compile(
     r"(?:\s+(?:to|for|of)\b[^.]{0,40})?\W*$"
 )
 GUESSED_MARK = "   [method not stated]"
-MAX_SECTION_PAGES = 3
+MAX_SECTION_PAGES = 10
+SECTION_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)+\.?|\d{1,2})\s+(\S.*)$")
 
 
 def _split_method(lines: list[tuple[int, str]], i: int) -> str | None:
@@ -168,27 +172,46 @@ def _split_url(lines: list[tuple[int, str]], j: int) -> str | None:
     return None
 
 
+def _url_path(url: str) -> str:
+    return normalize_path(re.sub(r"^https?://[^/]+", "", url).split("?")[0])
+
+
+def _explicit_nearby(lines: list[tuple[int, str]], url: str, window: range) -> bool:
+    """Is the same path already written as a complete 'METHOD /path' line close by?"""
+    target = _url_path(url)
+    return any(
+        normalize_path(m.group(3)) == target
+        for k in window
+        for m in ENDPOINT_RE.finditer(lines[k][1])
+    )
+
+
 def _split_endpoints(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
-    """Find endpoints whose method and URL sit on separate lines ('Method: GET' / 'Path: /x')."""
-    inserts: dict[int, str] = {}
+    """Find endpoints whose method and URL sit on separate lines ('Method: GET' / 'Path: /x').
+
+    Each method label is paired with the nearest unclaimed URL line between it and the
+    neighbouring method labels, preferring the URL above on ties.
+    """
+    inserts: dict[int, list[str]] = {}
     seen: dict[str, int] = {}
-    for i in range(len(lines)):
-        method = _split_method(lines, i)
-        if not method:
-            continue
-        window = range(max(0, i - 4), min(len(lines), i + 5))
-        if any(ENDPOINT_RE.search(lines[j][1]) for j in window):
-            continue
-        for j in sorted(window, key=lambda j: abs(j - i)):
-            url = _split_url(lines, j) if j != i else None
+    claimed: set[int] = set()
+    method_at = {i: m for i in range(len(lines)) if (m := _split_method(lines, i))}
+    labels = sorted(method_at)
+    for n, i in enumerate(labels):
+        lo = max(0, i - 4, labels[n - 1] + 1 if n else 0)
+        hi = min(len(lines), i + 5, labels[n + 1] if n + 1 < len(labels) else len(lines))
+        for j in sorted(range(lo, hi), key=lambda j: (abs(j - i), j > i)):
+            url = _split_url(lines, j) if j != i and j not in claimed else None
             if not url:
                 continue
-            key = f"{method} {url}"
-            if i - seen.get(key, -100) > 15:
-                inserts[min(i, j)] = key
+            claimed.add(j)
+            near = range(max(0, i - 4), min(len(lines), i + 5))
+            key = f"{method_at[i]} {url}"
+            if not _explicit_nearby(lines, url, near) and i - seen.get(key, -100) > 15:
+                inserts.setdefault(min(i, j), []).append(key)
                 seen[key] = i
             break
-    used = {k.split(" ", 1)[1] for k in inserts.values()}
+    used = {k.split(" ", 1)[1] for keys in inserts.values() for k in keys}
     for j in range(len(lines)):
         text = NUMBERING_RE.sub("", lines[j][1].strip())
         m = URL_LABEL_RE.match(text)
@@ -200,21 +223,20 @@ def _split_endpoints(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
         ):
             b = BARE_URL_RE.match(text)
             url = b.group(1) if b and "/" in b.group(1).split("://")[-1].strip("/") else None
-        if not url or url in used or ENDPOINT_RE.search(lines[j][1]):
+        if not url or url in used or j in claimed or ENDPOINT_RE.search(lines[j][1]):
             continue
         window = range(max(0, j - 4), min(len(lines), j + 5))
-        if any(ENDPOINT_RE.search(lines[k][1]) or _split_method(lines, k) for k in window):
+        if _explicit_nearby(lines, url, window) or any(k in method_at for k in window):
             continue
         ahead = " ".join(t for _, t in lines[j + 1 : j + 40])
         method = "POST" if re.search(r"(?i)request\s+(body|payload|parameters)", ahead) else "GET"
-        inserts.setdefault(j, f"{method} {url}{GUESSED_MARK}")
+        inserts.setdefault(j, []).append(f"{method} {url}{GUESSED_MARK}")
         used.add(url)
     if not inserts:
         return lines
     out: list[tuple[int, str]] = []
     for idx, item in enumerate(lines):
-        if idx in inserts:
-            out.append((item[0], inserts[idx]))
+        out.extend((item[0], key) for key in inserts.get(idx, []))
         out.append(item)
     return out
 
@@ -264,18 +286,38 @@ def _continues_path(path: str, head: str) -> bool:
     return "/" in head or "{" in head or head[0].islower() or head[0] in "{$"
 
 
-def _strip_server_prefixes(servers: list[str], paths: list[str]) -> list[str]:
-    """Drop a server's path prefix (e.g. /v2) when the documented paths already include it."""
-    out = []
+def _strip_server_prefixes(
+    servers: list[str], paths: list[str]
+) -> tuple[list[str], dict[str, str], list[str]]:
+    """Avoid '/v2/v2/...' when the documented paths repeat the server's path prefix.
+
+    If every path has the prefix, it is dropped from the server. If only some do, the server
+    keeps it and the prefix is removed from those paths instead. Returns the servers, path
+    renames and warnings.
+    """
+    out, partial = [], set()
     for url in servers:
         m = re.match(r"(https?://[^/]+)(/.*)?$", url)
         prefix = (m.group(2) or "").rstrip("/") if m else ""
-        if m and prefix:
-            covered = sum(p == prefix or p.startswith(prefix + "/") for p in paths)
-            if paths and covered * 2 >= len(paths):
-                url = m.group(1)
+        covered = [p for p in paths if p == prefix or p.startswith(prefix + "/")] if prefix else []
+        if covered and len(covered) == len(paths):
+            url = m.group(1)
+        elif covered:
+            partial.add(prefix)
         out.append(url)
-    return list(dict.fromkeys(out))
+    renames: dict[str, str] = {}
+    warnings: list[str] = []
+    if len(partial) == 1:
+        prefix = partial.pop()
+        renames = {
+            p: p[len(prefix) :] or "/" for p in paths if p == prefix or p.startswith(prefix + "/")
+        }
+    elif partial:
+        warnings.append(
+            f"servers have different path prefixes {sorted(partial)} that some paths repeat; "
+            "check the server URLs"
+        )
+    return list(dict.fromkeys(out)), renames, warnings
 
 
 def _title_before(lines: list[tuple[int, str]], i: int) -> str:
@@ -306,6 +348,16 @@ def _title_before(lines: list[tuple[int, str]], i: int) -> str:
     return fallback
 
 
+def _heading_depth(line: str) -> int | None:
+    """Depth of a numbered heading ('4.1.2 Get order' -> 3), or None for other lines."""
+    m = SECTION_NUMBER_RE.match(line)
+    if not m or not _is_heading_like(line) or CELL_SPLIT_RE.search(m.group(2)):
+        return None
+    if len(m.group(2).split()) > 8:
+        return None
+    return m.group(1).rstrip(".").count(".") + 1
+
+
 def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
     sections: list[Section] = []
     for i, (page, line) in enumerate(lines):
@@ -322,6 +374,7 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     page=page,
                     inline=line[m.end() :].removesuffix(GUESSED_MARK),
                     method_guessed=guessed,
+                    depth=_heading_depth(_title_before(lines, i)),
                     before=_title_before(lines, i),
                     query=[
                         k
@@ -330,8 +383,16 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     ],
                 )
             )
-        if not matches and sections and page - sections[-1].page < MAX_SECTION_PAGES:
-            sections[-1].lines.append((page, line))
+        if matches or not sections or sections[-1].closed:
+            continue
+        sec = sections[-1]
+        depth = _heading_depth(line)
+        if sec.depth and depth and depth <= sec.depth:
+            sec.closed = True
+        elif page - sec.page >= MAX_SECTION_PAGES:
+            sec.closed = sec.truncated = True
+        else:
+            sec.lines.append((page, line))
     return sections
 
 
@@ -755,6 +816,11 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
             continue
         best = max(main or secs, key=lambda s: len(s.lines))
         op = builder.operation(best, method, path)
+        if best.truncated:
+            warnings.append(
+                f"{method} {path}: section cut after {MAX_SECTION_PAGES} pages; "
+                "later details may be missing"
+            )
         if all(s.method_guessed for s in secs):
             op["x-method-guessed"] = True
             guessed.append(f"{method} {path}")
@@ -800,7 +866,11 @@ def extract_document(doc: pdf.Document) -> ExtractResult:
             "description": f"Generated by pdf2openapi from {Path(doc.path).name}.",
         },
     }
-    servers = _strip_server_prefixes(servers, list(paths))
+    servers, renames, prefix_warnings = _strip_server_prefixes(servers, list(paths))
+    warnings.extend(prefix_warnings)
+    for old, new in renames.items():
+        for method, op in paths.pop(old).items():
+            paths.setdefault(new, {}).setdefault(method, op)
     if servers:
         spec["servers"] = [{"url": s} for s in servers]
     spec["paths"] = dict(sorted(paths.items()))
