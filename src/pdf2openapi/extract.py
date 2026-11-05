@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -117,13 +118,37 @@ def normalize_path(raw: str) -> str:
 
 
 def _flat_lines(doc: pdf.Document) -> list[tuple[int, str]]:
-    lines = [
-        (page.number, line.rstrip())
-        for page in doc.pages
-        for line in page.full_text.splitlines()
-        if line.strip()
-    ]
+    pages = [[ln.rstrip() for ln in page.text.splitlines() if ln.strip()] for page in doc.pages]
+    running = _running_lines(pages)
+    lines: list[tuple[int, str]] = []
+    for page, text in zip(doc.pages, pages, strict=True):
+        edge = {*range(2), *range(len(text) - 2, len(text))}
+        lines.extend(
+            (page.number, ln)
+            for k, ln in enumerate(text)
+            if not (k in edge and _shape(ln) in running)
+        )
+        lines.extend((page.number, ln.rstrip()) for ln in page.ocr_text.splitlines() if ln.strip())
     return _split_endpoints(_join_wrapped_paths(lines))
+
+
+def _shape(line: str) -> str:
+    return re.sub(r"\d+", "#", line.strip())
+
+
+def _running_lines(pages: list[list[str]]) -> set[str]:
+    """Page headers and footers: the same line (ignoring numbers) at the edge of 3+ pages."""
+    counts: Counter[str] = Counter()
+    for text in pages:
+        counts.update({_shape(ln) for ln in text[:2] + text[-2:]})
+    return {
+        shape
+        for shape, n in counts.items()
+        if n >= 3
+        and not ENDPOINT_RE.search(shape)
+        and not _header_columns(shape)
+        and not _heading_kind(shape)
+    }
 
 
 _METHOD_ALT = "|".join(METHODS)
@@ -145,7 +170,13 @@ URL_LABEL_LINE_RE = re.compile(
 )
 GUESSED_MARK = "   [method not stated]"
 MAX_SECTION_PAGES = 10
-SECTION_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)+\.?|\d{1,2})\s+(\S.*)$")
+PERMISSION_RE = re.compile(r"^[\w-]+:[\w-]+:?[\w-]*(?:\s+[\u221a\u00d7])?$")
+GENERIC_HEADING_RE = re.compile(
+    r"(?i)^(?:web\s+)?(?:api\s+)?(?:specific\s+)?(?:business\s+)?(?:uri|url|endpoint|overview|introduction|description|"
+    r"request|response|specification|parameter|example|sample|function|constraint|"
+    r"authori[sz]ation|error|status)s?\b"
+)
+SECTION_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)+\.?|[1-9]\d?)\s+(\S.*)$")
 
 
 def _split_method(lines: list[tuple[int, str]], i: int) -> str | None:
@@ -353,17 +384,27 @@ def _heading_depth(line: str) -> int | None:
     m = SECTION_NUMBER_RE.match(line)
     if not m or not _is_heading_like(line) or CELL_SPLIT_RE.search(m.group(2)):
         return None
-    if len(m.group(2).split()) > 8:
+    if len(m.group(2).split()) > 12:
         return None
     return m.group(1).rstrip(".").count(".") + 1
 
 
 def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
     sections: list[Section] = []
+    headings: list[tuple[str, int]] = []
     for i, (page, line) in enumerate(lines):
         matches = list(ENDPOINT_RE.finditer(line))
-        if matches and sections and sections[-1].lines and _is_heading_like(lines[i - 1][1]):
+        prev = lines[i - 1] if i else None
+        if matches and sections and sections[-1].lines[-1:] == [prev] and _is_heading_like(prev[1]):
             sections[-1].lines.pop()
+        if matches:
+            before = _title_before(lines, i)
+            depth = _heading_depth(before)
+            titled = [h for h in headings if not GENERIC_HEADING_RE.match(_clean_summary(h[0]))]
+            generic = bool(GENERIC_HEADING_RE.match(_clean_summary(before)))
+            if titled and (depth is None or generic) and (titled[-1][1] >= 2 or not before):
+                before, depth = titled[-1]
+            headings = []
         for m in matches:
             guessed = line.endswith(GUESSED_MARK)
             sections.append(
@@ -374,8 +415,8 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     page=page,
                     inline=line[m.end() :].removesuffix(GUESSED_MARK),
                     method_guessed=guessed,
-                    depth=_heading_depth(_title_before(lines, i)),
-                    before=_title_before(lines, i),
+                    depth=depth,
+                    before=before,
                     query=[
                         k
                         for k in re.findall(r"[?&]([A-Za-z_][\w\-.]*)=", m.group(4) or "")
@@ -383,10 +424,14 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
                     ],
                 )
             )
-        if matches or not sections or sections[-1].closed:
+        if matches:
+            continue
+        depth = _heading_depth(line)
+        if depth:
+            headings.append((line, depth))
+        if not sections or sections[-1].closed:
             continue
         sec = sections[-1]
-        depth = _heading_depth(line)
         if sec.depth and depth and depth <= sec.depth:
             sec.closed = True
         elif page - sec.page >= MAX_SECTION_PAGES:
@@ -409,6 +454,8 @@ def _clean_summary(text: str) -> str:
     if re.match(r"(?i)https?://|[?&/]", text.strip()):
         return ""
     text = text.strip(" \t-:|\u2013\u2014")
+    if PERMISSION_RE.match(text) or not re.search(r"[A-Za-z]", text):
+        return ""
     return re.sub(r"\s{2,}", " ", text)
 
 

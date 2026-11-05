@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import pytest
-from conftest import build_vendor_pdf
+from conftest import PdfBuilder, build_vendor_pdf
 
 from pdf2openapi import extract
-from pdf2openapi.extract import normalize_path
+from pdf2openapi.extract import _clean_summary, _heading_depth, normalize_path
 from pdf2openapi.pdf import ocr_available
 from pdf2openapi.schema import flatten, parse_type
 from pdf2openapi.validate import validate_spec
@@ -280,3 +280,75 @@ def test_mixed_server_prefix_paths(tmp_path):
     spec = extract(b.save(tmp_path / "prefix.pdf"), ocr=False).spec
     assert spec["servers"] == [{"url": "https://api.test/v2"}]
     assert _ops(spec) == ["GET /health", "GET /orders"]
+
+
+def test_path_wrapped_inside_table_cell(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("Permissions", 14)
+    b.row("API", "Action")
+    page, y = b.page, b.y
+    page.insert_text((60, y), "POST /v1.0/", fontsize=10)
+    page.insert_text((190, y), "vod:asset:create", fontsize=10)
+    for k, part in enumerate(["{project_id}/asset/", "template-", "collection"], 1):
+        page.insert_text((60, y + 13 * k), part, fontsize=10)
+    b.y = y + 80
+    b.line("Create a collection", 14)
+    b.line("POST /v1.0/{project_id}/asset/template-collection")
+    b.line("Creates a template collection.")
+    b.line("200 OK")
+    result = extract(b.save(tmp_path / "wrapped.pdf"), ocr=False)
+
+    assert list(result.spec["paths"]) == ["/v1.0/{project_id}/asset/template-collection"]
+    op = result.spec["paths"]["/v1.0/{project_id}/asset/template-collection"]["post"]
+    assert op["summary"] == "Create a collection"
+
+
+def test_running_headers_are_dropped(tmp_path):
+    b = PdfBuilder()
+    for n, (title, path) in enumerate(
+        [("List orders", "/orders"), ("List refunds", "/refunds"), ("List users", "/users")], 1
+    ):
+        b.new_page()
+        b.line(f"Acme API Reference   Page {n} of 3")
+        b.line(title, 14)
+        b.line(f"GET {path}")
+        b.line(f"Returns all {path[1:]}.")
+        b.line("200 OK")
+    result = extract(b.save(tmp_path / "headers.pdf"), ocr=False)
+
+    assert len(result.spec["paths"]) == 3
+    assert not any("Acme API Reference" in text for text in result.sections.values())
+    assert result.spec["paths"]["/refunds"]["get"]["summary"] == "List refunds"
+
+
+def test_generic_numbered_headings_do_not_become_the_section(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("4.1 Bids API", 14)
+    b.line("4.1.1 Overview")
+    b.line("Returns bids.")
+    b.line("4.1.2 URI to access the Web API")
+    b.line("POST /api-bids/v1")
+    b.line("4.1.3 Specifications")
+    b.line("Body Parameters")
+    b.row("Name", "Type", "Required", "Description")
+    b.row("bid_id", "string", "Yes", "Bid ID")
+    b.line("4.2 Offers API", 14)
+    b.line("POST /api-offers/v1")
+    b.line("200 OK")
+    spec = extract(b.save(tmp_path / "generic.pdf"), ocr=False).spec
+
+    bids = spec["paths"]["/api-bids/v1"]["post"]
+    assert bids["summary"] == "Bids API"
+    assert "bid_id" in flatten(bids["requestBody"]["content"]["application/json"]["schema"])
+
+
+@pytest.mark.parametrize("text", ["vod:asset:create", "vod:category:li \u221a", "}", "\u25cf"])
+def test_permission_names_and_symbols_are_not_summaries(text):
+    assert _clean_summary(text) == ""
+
+
+def test_zero_row_number_is_not_a_heading():
+    assert _heading_depth("0   Top level hierarchy for query elements") is None
+    assert (
+        _heading_depth("4.1.2 Bid Information Shipper View \u2013 Normal Pricing Strategy API") == 3
+    )
