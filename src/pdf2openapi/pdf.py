@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -63,16 +64,67 @@ def _page_lines(page: pymupdf.Page) -> str:
             rows[-1][1].append(w)
         else:
             rows.append([mid, [w]])
-    lines = []
-    for _, ws in rows:
-        ws.sort(key=lambda w: w[0])
-        parts = [ws[0][4]]
-        for prev, cur in zip(ws, ws[1:], strict=False):
-            height = max(cur[3] - cur[1], 1)
-            parts.append("   " if cur[0] - prev[2] > 0.9 * height else " ")
-            parts.append(cur[4])
-        lines.append("".join(parts))
-    return "\n".join(lines)
+    cells = [_cells(sorted(ws, key=lambda w: w[0])) for _, ws in rows]
+    _join_wrapped_cells(cells)
+    return "\n".join("   ".join(" ".join(w[4] for w in c) for c in row) for row in cells if row)
+
+
+def _cells(ws: list) -> list[list]:
+    out = [[ws[0]]]
+    for prev, cur in zip(ws, ws[1:], strict=False):
+        if cur[0] - prev[2] > 0.9 * max(cur[3] - cur[1], 1):
+            out.append([cur])
+        else:
+            out[-1].append(cur)
+    return out
+
+
+METHOD_WORDS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+WRAPPED_RE = re.compile(r"^(?:https?://\S+)?/\S*(?:[/-]|\{[^}]*)$")
+PATH_WORD_RE = re.compile(r"^(?:https?://\S+)?/[\w{}$\-.~%:/]*$")
+CONTINUATION_RE = re.compile(r"[\w{}$\-.~%:/]+")
+
+
+def _join_wrapped_cells(rows: list[list[list]]) -> None:
+    """Rejoin URL paths that wrap inside a table cell ('POST /v1/{id}/' over 'orders').
+
+    The rest of the path starts a cell on a following row, at the same x as the path's cell.
+    """
+    for r, row in enumerate(rows):
+        for cell in row:
+            for k, w in enumerate(cell):
+                strong = bool(WRAPPED_RE.match(w[4]))
+                weak = k == len(cell) - 1 and bool(PATH_WORD_RE.match(w[4]))
+                if not (strong or weak):
+                    continue
+                if k and cell[k - 1][4] not in METHOD_WORDS and not cell[0][4].startswith("/"):
+                    continue
+                left, text, joined = cell[0][0], w[4], False
+                for nxt in rows[r + 1 : r + 8]:
+                    match = next((c for c in nxt if abs(c[0][0] - left) <= 3), None)
+                    if not match:
+                        continue
+                    word = match[0][4]
+                    if len(match) > 1 and "/" not in word:
+                        break
+                    if not _continues(text, word, strong, joined):
+                        break
+                    text, joined = text + word, True
+                    match.pop(0)
+                    if not match:
+                        nxt.remove(match)
+                    strong = bool(WRAPPED_RE.match(text))
+                cell[k] = (*w[:4], text, *w[5:])
+
+
+def _continues(path: str, word: str, strong: bool, joined: bool) -> bool:
+    if not CONTINUATION_RE.fullmatch(word) or word.upper() in METHOD_WORDS:
+        return False
+    if not strong:
+        return "/" in word and "://" not in word and (joined or not word.startswith("/"))
+    if path.count("{") > path.count("}"):
+        return True
+    return word[0] in "{/$" or word[0].islower() or "/" in word or "{" in word
 
 
 def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
