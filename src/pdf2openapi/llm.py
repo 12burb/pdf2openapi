@@ -308,6 +308,32 @@ def _body_fields_to_query(body: dict[str, Any], params: list[dict[str, Any]]) ->
             params.append(param)
 
 
+def _fix_stray_path_params(
+    cleaned: dict[str, Any], op: dict[str, Any], method: str, path_params: set[str]
+) -> None:
+    """Models mark body or query fields 'in: path'; only valid when the path has {name}."""
+    stray = [p for p in cleaned["parameters"] if p["in"] == "path" and p["name"] not in path_params]
+    if not stray:
+        return
+    cleaned["parameters"] = [p for p in cleaned["parameters"] if p not in stray]
+    if method.lower() in BODYLESS_METHODS:
+        for p in stray:
+            p["in"] = "query"
+            p.pop("required", None)
+        cleaned["parameters"].extend(stray)
+        return
+    body = cleaned.get("requestBody") or op.get("requestBody") or {}
+    media = next(iter(body.get("content", {}).values()), None)
+    schema = media.get("schema") if isinstance(media, dict) else None
+    if not (isinstance(schema, dict) and schema.get("type", "object") == "object"):
+        schema = {"type": "object", "properties": {}}
+        body = {"content": {"application/json": {"schema": schema}}}
+    props = schema.setdefault("properties", {})
+    for p in stray:
+        props.setdefault(p["name"], p.get("schema") or {"type": "string"})
+    cleaned["requestBody"] = body
+
+
 def _keep_rule_params(rule: list[dict[str, Any]], cleaned: list[dict[str, Any]]) -> None:
     """Models often drop required inputs they consider obvious (e.g. RPC 'api'/'method')."""
     have = {p["name"] for p in cleaned}
@@ -355,6 +381,7 @@ async def enrich(
                     progress(done, len(tasks))
         path_params = set(re.findall(r"\{(\w+)\}", path))
         if "parameters" in cleaned:
+            _fix_stray_path_params(cleaned, op, method, path_params)
             _keep_rule_params(op.get("parameters", []), cleaned["parameters"])
             declared = {p["name"] for p in cleaned["parameters"] if p["in"] == "path"}
             for name in sorted(path_params - declared):

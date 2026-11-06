@@ -180,3 +180,28 @@ def test_timeout_and_ollama_context():
     assert llm.resolve_provider(env=env).timeout == 42
     with pytest.raises(llm.ProviderError):
         llm.resolve_provider(env={**env, "PDF2OPENAPI_TIMEOUT": "soon"})
+
+
+def test_stray_ai_path_params_become_body_fields(vendor_pdf):
+    result = extract(vendor_pdf, ocr=False)
+    reply = json.dumps(
+        {
+            "parameters": [
+                {"name": "channel", "in": "path", "schema": {"type": "string", "enum": ["web"]}},
+                {"name": "order_id", "in": "path"},
+            ]
+        }
+    )
+    asyncio.run(llm.enrich(result, FakeProvider(reply)))
+    post = result.spec["paths"]["/v2/orders"]["post"]
+    assert all(p["in"] != "path" for p in post.get("parameters", []))
+    props = post["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert props["channel"] == {"type": "string", "enum": ["web"]}
+    get = result.spec["paths"]["/v2/orders/{order_id}"]["get"]
+    assert {(p["in"], p["name"]) for p in get["parameters"]} == {
+        ("query", "channel"),
+        ("path", "order_id"),
+    }
+    from pdf2openapi.validate import validate_spec
+
+    assert validate_spec(result.spec)[0] == []

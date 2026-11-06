@@ -127,6 +127,15 @@ def _continues(path: str, word: str, strong: bool, joined: bool) -> bool:
     return word[0] in "{/$" or word[0].islower() or "/" in word or "{" in word
 
 
+def _png_for_ocr(pix: pymupdf.Pixmap) -> bytes:
+    """PNG needs gray or RGB without alpha; PDFs also embed RGBA and CMYK images."""
+    if pix.alpha:
+        pix = pymupdf.Pixmap(pix, 0)
+    if pix.colorspace and pix.colorspace.n not in (1, 3):
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    return pix.tobytes("png")
+
+
 def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
     texts = []
     for img in page.get_images(full=True):
@@ -137,11 +146,7 @@ def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
         if pix.width < MIN_IMAGE_WIDTH or pix.height < MIN_IMAGE_HEIGHT:
             continue
         try:
-            if pix.alpha:
-                pix = pymupdf.Pixmap(pix, 0)
-            if pix.n >= 4 or (pix.colorspace and pix.colorspace.n not in (1, 3)):
-                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-            png = pix.tobytes("png")
+            png = _png_for_ocr(pix)
         except (RuntimeError, ValueError):
             continue
         text = _ocr_png(png)
