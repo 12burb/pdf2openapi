@@ -136,9 +136,15 @@ def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
             continue
         if pix.width < MIN_IMAGE_WIDTH or pix.height < MIN_IMAGE_HEIGHT:
             continue
-        if pix.alpha or pix.n - pix.alpha >= 4:
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix, 0)
-        text = _ocr_png(pix.tobytes("png"))
+        try:
+            if pix.alpha:
+                pix = pymupdf.Pixmap(pix, 0)
+            if pix.n >= 4 or (pix.colorspace and pix.colorspace.n not in (1, 3)):
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            png = pix.tobytes("png")
+        except (RuntimeError, ValueError):
+            continue
+        text = _ocr_png(png)
         if text.strip():
             texts.append(text)
     return "\n".join(texts)
