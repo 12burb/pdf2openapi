@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import pymupdf
 import pytest
 from conftest import PdfBuilder, build_vendor_pdf
 
-from pdf2openapi import extract
+from pdf2openapi import extract, pdf
 from pdf2openapi.extract import _clean_summary, _heading_depth, normalize_path
 from pdf2openapi.pdf import ocr_available
 from pdf2openapi.schema import flatten, parse_type
@@ -441,3 +442,12 @@ def test_wrapped_prose_does_not_switch_table_context(tmp_path):
     result = extract(b.save(tmp_path / "wrap.pdf"), ocr=False)
     params = {p["name"]: p["in"] for p in result.spec["paths"]["/v1/stats"]["get"]["parameters"]}
     assert params.get("X-Sdk-Date") == "header"
+
+
+@pytest.mark.parametrize("cs,alpha", [(pymupdf.csRGB, True), (pymupdf.csCMYK, False)])
+def test_ocr_converts_rgba_and_cmyk_images(cs, alpha):
+    pix = pymupdf.Pixmap(cs, pymupdf.IRect(0, 0, 8, 8), alpha)
+    pix.clear_with(255)
+    png = pdf._png_for_ocr(pix)
+    out = pymupdf.Pixmap(png)
+    assert (out.n, out.alpha) == (3, 0)

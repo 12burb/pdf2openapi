@@ -29,7 +29,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(f"Refining with {provider.name}...", file=sys.stderr)
-        asyncio.run(llm.enrich(result, provider))
+
+        def progress(done: int, total: int) -> None:
+            end = "\n" if done == total else ""
+            print(f"\r  {done}/{total} endpoints", end=end, file=sys.stderr, flush=True)
+
+        asyncio.run(llm.enrich(result, provider, progress=progress))
     fmt = args.format or ("json" if args.output and args.output.endswith(".json") else "yaml")
     text = dump(result.spec, fmt)
     if args.output:

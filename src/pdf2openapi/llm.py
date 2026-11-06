@@ -20,11 +20,28 @@ SYSTEM_PROMPT = (
 )
 MAX_EXCERPT_CHARS = 12000
 DEFAULT_MODELS = {"openai": "gpt-4o-mini", "gemini": "gemini-2.5-flash", "ollama": "llama3.1"}
+BODYLESS_METHODS = ("get", "head", "delete", "options")
 ALLOWED_KEYS = ("summary", "description", "parameters", "requestBody", "responses")
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, fatal: bool = False):
+        super().__init__(message)
+        self.fatal = fatal
+
+
+def _error_message(resp: httpx.Response) -> str:
+    try:
+        err = resp.json().get("error")
+    except ValueError:
+        err = None
+    if isinstance(err, dict) and err.get("message"):
+        text = str(err["message"])
+    elif isinstance(err, str):
+        text = err
+    else:
+        text = resp.text
+    return " ".join(text.split())[:300]
 
 
 class Provider(Protocol):
@@ -36,18 +53,32 @@ class Provider(Protocol):
 class _HTTPProvider:
     name = "http"
 
-    def __init__(self, model: str, transport: httpx.AsyncBaseTransport | None = None):
+    timeout = 180.0
+
+    def __init__(
+        self,
+        model: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout: float | None = None,
+    ):
         self.model = model
         self._transport = transport
+        if timeout:
+            self.timeout = timeout
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=180, transport=self._transport)
+        return httpx.AsyncClient(timeout=self.timeout, transport=self._transport)
 
     async def _post(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> Any:
         async with self._client() as client:
             resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code >= 400:
-            raise ProviderError(f"{self.name} returned HTTP {resp.status_code}: {resp.text[:300]}")
+            message = _error_message(resp)
+            # Bad key, no access or unknown model: every other call would fail the same way.
+            fatal = resp.status_code in (401, 403, 404) or "API_KEY_INVALID" in resp.text
+            raise ProviderError(
+                f"{self.name} returned HTTP {resp.status_code}: {message}", fatal=fatal
+            )
         return resp.json()
 
 
@@ -103,6 +134,7 @@ class OllamaProvider(_HTTPProvider):
     """Local models via Ollama. No key, nothing leaves the machine."""
 
     name = "ollama"
+    timeout = 900.0  # CPU-only machines can take minutes per endpoint
 
     def __init__(self, model: str, host: str | None = None, **kw: Any):
         super().__init__(model, **kw)
@@ -115,7 +147,8 @@ class OllamaProvider(_HTTPProvider):
                 "model": self.model,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0},
+                # Ollama's default context window would silently cut long excerpts.
+                "options": {"temperature": 0, "num_ctx": 16384},
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
@@ -163,18 +196,23 @@ def resolve_provider(
             "or use --provider ollama for a free local model."
         )
     model = model or env.get("PDF2OPENAPI_MODEL") or DEFAULT_MODELS.get(name)
+    try:
+        timeout = float(env.get("PDF2OPENAPI_TIMEOUT") or 0) or None
+    except ValueError as exc:
+        raise ProviderError("PDF2OPENAPI_TIMEOUT must be a number of seconds") from exc
+    kw: dict[str, Any] = {"transport": transport, "timeout": timeout}
     if name == "openai":
         key = env.get("OPENAI_API_KEY")
         if not key:
             raise ProviderError("OPENAI_API_KEY is not set")
-        return OpenAIProvider(key, model, env.get("OPENAI_BASE_URL"), transport=transport)
+        return OpenAIProvider(key, model, env.get("OPENAI_BASE_URL"), **kw)
     if name == "gemini":
         key = env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY")
         if not key:
             raise ProviderError("GEMINI_API_KEY is not set")
-        return GeminiProvider(key, model, transport=transport)
+        return GeminiProvider(key, model, **kw)
     if name == "ollama":
-        return OllamaProvider(model, env.get("OLLAMA_HOST"), transport=transport)
+        return OllamaProvider(model, env.get("OLLAMA_HOST"), **kw)
     raise ProviderError(f"unknown provider '{name}' (use openai, gemini or ollama)")
 
 
@@ -204,7 +242,7 @@ def _build_prompt(key: str, op: dict[str, Any], excerpt: str) -> str:
     )
 
 
-def _clean_operation(reply: dict[str, Any]) -> dict[str, Any]:
+def _clean_operation(reply: dict[str, Any], method: str = "post") -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in ("summary", "description"):
         if isinstance(reply.get(key), str) and reply[key].strip():
@@ -225,7 +263,10 @@ def _clean_operation(reply: dict[str, Any]) -> dict[str, Any]:
         out["parameters"] = good
     body = reply.get("requestBody")
     if isinstance(body, dict) and isinstance(body.get("content"), dict):
-        out["requestBody"] = body
+        if method.lower() in BODYLESS_METHODS:
+            _body_fields_to_query(body, out.setdefault("parameters", []))
+        elif any(_body_props(media) is not False for media in body["content"].values()):
+            out["requestBody"] = body
     responses = reply.get("responses")
     if isinstance(responses, dict) and responses:
         cleaned = {}
@@ -238,26 +279,110 @@ def _clean_operation(reply: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def enrich(result: ExtractResult, provider: Provider, concurrency: int = 4) -> ExtractResult:
+def _body_props(media: Any) -> dict[str, Any] | None | bool:
+    """Schema properties of a media type; False when the schema is an empty object."""
+    schema = media.get("schema") if isinstance(media, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties")
+    if props == {} and schema.get("type", "object") == "object":
+        return False
+    return props if isinstance(props, dict) else None
+
+
+def _body_fields_to_query(body: dict[str, Any], params: list[dict[str, Any]]) -> None:
+    """GET/DELETE bodies are ignored by most tools; models that add one usually mean the query."""
+    have = {p["name"] for p in params}
+    for media in body["content"].values():
+        props = _body_props(media)
+        if not props:
+            continue
+        required = set(media["schema"].get("required") or [])
+        for name, prop in props.items():
+            if name in have:
+                continue
+            have.add(name)
+            param = {"name": name, "in": "query", "schema": prop if isinstance(prop, dict) else {}}
+            if name in required:
+                param["required"] = True
+            params.append(param)
+
+
+def _fix_stray_path_params(
+    cleaned: dict[str, Any], op: dict[str, Any], method: str, path_params: set[str]
+) -> None:
+    """Models mark body or query fields 'in: path'; only valid when the path has {name}."""
+    stray = [p for p in cleaned["parameters"] if p["in"] == "path" and p["name"] not in path_params]
+    if not stray:
+        return
+    cleaned["parameters"] = [p for p in cleaned["parameters"] if p not in stray]
+    if method.lower() in BODYLESS_METHODS:
+        for p in stray:
+            p["in"] = "query"
+            p.pop("required", None)
+        cleaned["parameters"].extend(stray)
+        return
+    body = cleaned.get("requestBody") or op.get("requestBody") or {}
+    media = next(iter(body.get("content", {}).values()), None)
+    schema = media.get("schema") if isinstance(media, dict) else None
+    if not (isinstance(schema, dict) and schema.get("type", "object") == "object"):
+        schema = {"type": "object", "properties": {}}
+        body = {"content": {"application/json": {"schema": schema}}}
+    props = schema.setdefault("properties", {})
+    for p in stray:
+        props.setdefault(p["name"], p.get("schema") or {"type": "string"})
+    cleaned["requestBody"] = body
+
+
+def _keep_rule_params(rule: list[dict[str, Any]], cleaned: list[dict[str, Any]]) -> None:
+    """Models often drop required inputs they consider obvious (e.g. RPC 'api'/'method')."""
+    have = {p["name"] for p in cleaned}
+    for p in rule:
+        if p["name"] not in have and (p.get("required") or p["in"] == "path"):
+            cleaned.append(p)
+
+
+async def enrich(
+    result: ExtractResult,
+    provider: Provider,
+    concurrency: int = 4,
+    progress: Callable[[int, int], None] | None = None,
+) -> ExtractResult:
     """Ask the model to correct each operation from its source excerpt, in place."""
     sem = asyncio.Semaphore(concurrency)
+    stopped: list[str] = []
+    failures: dict[str, list[str]] = {}
+    done = 0
 
     async def refine(path: str, method: str, op: dict[str, Any]) -> None:
         key = f"{method.upper()} {path}"
         excerpt = result.sections.get(key)
         if not excerpt:
             return
+        nonlocal done
         async with sem:
+            if stopped:
+                return
             try:
                 reply = await provider.complete(SYSTEM_PROMPT, _build_prompt(key, op, excerpt))
-                cleaned = _clean_operation(parse_json_object(reply))
-            except Exception as exc:  # noqa: BLE001 - keep the rule-based result on any failure
-                result.warnings.append(
-                    f"{key}: AI refinement failed ({exc}); kept rule-based result"
-                )
+                cleaned = _clean_operation(parse_json_object(reply), method)
+            except ProviderError as exc:
+                if exc.fatal:
+                    stopped.append(str(exc))
+                else:
+                    failures.setdefault(str(exc), []).append(key)
                 return
+            except Exception as exc:  # noqa: BLE001 - keep the rule-based result on any failure
+                failures.setdefault(str(exc) or type(exc).__name__, []).append(key)
+                return
+            finally:
+                done += 1
+                if progress:
+                    progress(done, len(tasks))
         path_params = set(re.findall(r"\{(\w+)\}", path))
         if "parameters" in cleaned:
+            _fix_stray_path_params(cleaned, op, method, path_params)
+            _keep_rule_params(op.get("parameters", []), cleaned["parameters"])
             declared = {p["name"] for p in cleaned["parameters"] if p["in"] == "path"}
             for name in sorted(path_params - declared):
                 cleaned["parameters"].append(
@@ -272,6 +397,12 @@ async def enrich(result: ExtractResult, provider: Provider, concurrency: int = 4
         refine(path, method, op)
         for path, item in result.spec.get("paths", {}).items()
         for method, op in item.items()
+        if f"{method.upper()} {path}" in result.sections
     ]
     await asyncio.gather(*tasks)
+    if stopped:
+        result.warnings.append(f"AI refinement stopped: {stopped[0]}. Kept rule-based results.")
+    for message, keys in failures.items():
+        where = keys[0] if len(keys) == 1 else f"{len(keys)} endpoints (e.g. {keys[0]})"
+        result.warnings.append(f"{where}: AI refinement failed ({message}); kept rule-based result")
     return result

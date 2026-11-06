@@ -106,3 +106,102 @@ def test_provider_http_error_is_reported():
     p = llm.resolve_provider(env={"OPENAI_API_KEY": "x"}, transport=transport)
     with pytest.raises(llm.ProviderError, match="HTTP 401"):
         asyncio.run(p.complete("s", "p"))
+
+
+def test_fatal_provider_error_stops_with_one_warning(vendor_pdf):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        body = {"error": {"message": "Incorrect API key provided", "code": "invalid_api_key"}}
+        return httpx.Response(401, json=body)
+
+    result = extract(vendor_pdf, ocr=False)
+    p = llm.resolve_provider(env={"OPENAI_API_KEY": "x"}, transport=httpx.MockTransport(handler))
+    asyncio.run(llm.enrich(result, p, concurrency=1))
+    assert len(calls) == 1
+    ai = [w for w in result.warnings if "AI refinement" in w]
+    assert ai == [
+        "AI refinement stopped: openai returned HTTP 401: Incorrect API key provided. "
+        "Kept rule-based results."
+    ]
+
+
+def test_repeated_failures_are_collapsed(vendor_pdf):
+    result = extract(vendor_pdf, ocr=False)
+    asyncio.run(llm.enrich(result, FakeProvider("not json")))
+    ai = [w for w in result.warnings if "AI refinement failed" in w]
+    assert len(ai) == 1 and ai[0].startswith(f"{len(result.sections)} endpoints")
+
+
+def test_enrich_keeps_required_rule_params_and_moves_get_body_to_query(vendor_pdf):
+    result = extract(vendor_pdf, ocr=False)
+    get = result.spec["paths"]["/v2/orders/{order_id}"]["get"]
+    get.setdefault("parameters", []).append(
+        {"name": "api", "in": "query", "required": True, "schema": {"enum": ["X"]}}
+    )
+    reply = json.dumps(
+        {
+            "parameters": [{"name": "expand", "in": "query"}],
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"fields": {"type": "string"}},
+                            "required": ["fields"],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    asyncio.run(llm.enrich(result, FakeProvider(reply)))
+    assert "requestBody" not in get
+    params = {p["name"]: p for p in get["parameters"]}
+    assert set(params) == {"expand", "fields", "api", "order_id"}
+    assert params["fields"]["in"] == "query" and params["fields"]["required"]
+    post = result.spec["paths"]["/v2/orders"]["post"]
+    assert post["requestBody"]["content"]["application/json"]["schema"]["required"] == ["fields"]
+
+
+def test_empty_ai_body_is_dropped():
+    body = {"content": {"application/x-www-form-urlencoded": {"schema": {"properties": {}}}}}
+    assert "requestBody" not in llm._clean_operation({"requestBody": body}, "post")
+
+
+def test_timeout_and_ollama_context():
+    seen, transport = _capture({"message": {"content": "{}"}})
+    p = llm.resolve_provider("ollama", env={}, transport=transport)
+    assert p.timeout == 900
+    asyncio.run(p.complete("s", "p"))
+    assert seen["body"]["options"]["num_ctx"] >= 16384
+    env = {"OPENAI_API_KEY": "x", "PDF2OPENAPI_TIMEOUT": "42"}
+    assert llm.resolve_provider(env=env).timeout == 42
+    with pytest.raises(llm.ProviderError):
+        llm.resolve_provider(env={**env, "PDF2OPENAPI_TIMEOUT": "soon"})
+
+
+def test_stray_ai_path_params_become_body_fields(vendor_pdf):
+    result = extract(vendor_pdf, ocr=False)
+    reply = json.dumps(
+        {
+            "parameters": [
+                {"name": "channel", "in": "path", "schema": {"type": "string", "enum": ["web"]}},
+                {"name": "order_id", "in": "path"},
+            ]
+        }
+    )
+    asyncio.run(llm.enrich(result, FakeProvider(reply)))
+    post = result.spec["paths"]["/v2/orders"]["post"]
+    assert all(p["in"] != "path" for p in post.get("parameters", []))
+    props = post["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert props["channel"] == {"type": "string", "enum": ["web"]}
+    get = result.spec["paths"]["/v2/orders/{order_id}"]["get"]
+    assert {(p["in"], p["name"]) for p in get["parameters"]} == {
+        ("query", "channel"),
+        ("path", "order_id"),
+    }
+    from pdf2openapi.validate import validate_spec
+
+    assert validate_spec(result.spec)[0] == []
