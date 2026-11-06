@@ -14,7 +14,7 @@ from mcp.types import ClientCapabilities, SamplingCapability, SamplingMessage, T
 
 from . import llm, pdf
 from .diff import diff_specs, load_spec
-from .extract import extract_document
+from .extract import ai_hint, extract_document
 from .output import dump
 from .validate import validate_spec
 
@@ -94,6 +94,9 @@ async def extract_openapi(
     if output_path:
         Path(output_path).write_text(text, encoding="utf-8")
     header = "".join(f"# warning: {w}\n" for w in result.warnings)
+    hint = None if use_ai else ai_hint(result.spec)
+    if hint:
+        header += f"# tip: {hint} Call again with use_ai=true, or check with read_pdf_pages.\n"
     return header + text
 
 

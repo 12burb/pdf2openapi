@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import yaml
+from conftest import PdfBuilder
 
 from pdf2openapi.cli import main
 from pdf2openapi.diff import diff_specs, load_spec
@@ -221,3 +222,12 @@ def test_fetch_credentials_not_sent_to_redirect_target():
     assert body == b"ok"
     assert seen[0][0] == "docs.vendor.test" and seen[0][1].startswith("Basic ")
     assert seen[1] == ("cdn.other.test", None)
+
+
+def test_cli_extract_tip_only_without_ai(tmp_path, capsys):
+    b = PdfBuilder().new_page()
+    b.line("POST /v1/things")
+    pdf_path = b.save(tmp_path / "thin.pdf")
+    assert main(["extract", str(pdf_path), "-o", str(tmp_path / "t.yaml"), "--no-ocr"]) == 0
+    err = capsys.readouterr().err
+    assert "tip: 1 of 1 endpoints look incomplete" in err and "--provider ollama" in err

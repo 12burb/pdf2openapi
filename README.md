@@ -8,7 +8,8 @@ retyping it all into Postman and only notice changes when production breaks.
 `pdf2openapi` does the retyping for you and diffs each new PDF against the last one.
 
 - **Runs locally.** No account, no server, nothing uploaded. Your PDFs stay on your machine.
-- **Works without AI.** A rule-based parser plus OCR handles most well-structured docs.
+- **No AI and no API key needed.** A rule-based parser plus OCR handles most well-structured
+  docs. Extraction, diffs and validation all work offline.
 - **AI is optional, with your own model:** OpenAI, Gemini, a local Ollama model, or the model
   of the MCP client you are already using (Claude, Cursor, and others).
 - **Cites its sources.** Every operation has `x-source-pages` so you can check it.
@@ -34,6 +35,14 @@ pdf2openapi diff vendor-api-v1.pdf vendor-api-v2.pdf
 pdf2openapi validate vendor-api.yaml --base-url https://sandbox.vendor.com -H "X-Api-Key: $KEY"
 ```
 
+None of these need AI or a key. When the rule-based result looks thin, `extract` says so:
+
+```text
+tip: 2 of 10 endpoints look incomplete (no summary or no request fields): PUT /v1/media/{name},
+POST /v1/sendsms. AI refinement can fill these in. Re-run with --ai, or --provider ollama for a
+free local model (no key needed).
+```
+
 Import the generated spec into Postman, Insomnia or Bruno, or generate a typed client
 with any OpenAPI generator.
 
@@ -50,7 +59,7 @@ Example `diff` output:
 - **BREAKING** `POST /v2/orders`: body field 'reference' added (required)
 ```
 
-## Optional AI refinement (bring your own model)
+## Optional: AI refinement (bring your own model)
 
 The rule-based parser struggles with docs that describe fields in free prose. Add `--ai` and
 each endpoint's source pages are sent to a model, which corrects the draft. Only the pages
