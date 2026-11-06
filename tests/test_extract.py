@@ -352,3 +352,92 @@ def test_zero_row_number_is_not_a_heading():
     assert (
         _heading_depth("4.1.2 Bid Information Shipper View \u2013 Normal Pricing Strategy API") == 3
     )
+
+
+def _rpc_pdf(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("SYNO.Acme.List", 14)
+    b.line("Method")
+    b.line("list")
+    b.line("Description:")
+    b.line("Enumerate files in a given folder.")
+    b.line("Request:")
+    b.row("Parameter", "Description", "Value", "Availability")
+    b.row("folder_path", "String", "(None)", "1 and later")
+    b.row("offset", "files skipped", "Integer", "0")
+    b.line("Example:")
+    b.line("GET /webapi/entry.cgi?api=SYNO.Acme.List&version=2&method=list&")
+    b.line("folder_path=%22%2Fvideo%22")
+    b.line("Response:")
+    b.row("Parameter", "Type", "Description", "Availability")
+    b.row("total", "Integer", "Total number of files.", "1 and later")
+    b.line("Method")
+    b.line("stop")
+    b.line("Description:")
+    b.line("Stop the listing task.")
+    b.line("Request:")
+    b.row("Parameter", "Type", "Description", "Availability")
+    b.row("taskid", "String", "A unique task ID.", "1 and later")
+    b.line("Example:")
+    b.line("GET /webapi/entry.cgi?api=SYNO.Acme.List&version=1&method%3Dstop&taskid=%22x%22")
+    return extract(b.save(tmp_path / "rpc.pdf"), ocr=False)
+
+
+def test_query_rpc_methods_become_separate_operations(tmp_path):
+    result = _rpc_pdf(tmp_path)
+    paths = result.spec["paths"]
+    assert sorted(paths) == [
+        "/webapi/entry.cgi?api=SYNO.Acme.List&method=list",
+        "/webapi/entry.cgi?api=SYNO.Acme.List&method=stop",
+    ]
+    op = paths["/webapi/entry.cgi?api=SYNO.Acme.List&method=list"]["get"]
+    assert op["summary"] == "Enumerate files in a given folder."
+    params = {p["name"]: p for p in op["parameters"]}
+    assert params["method"]["schema"]["enum"] == ["list"] and params["method"]["required"]
+    assert params["api"]["schema"]["enum"] == ["SYNO.Acme.List"]
+    assert params["offset"]["schema"]["type"] == "integer"
+    assert {"folder_path", "version"} <= set(params)
+    assert "total" in op["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+    stop = paths["/webapi/entry.cgi?api=SYNO.Acme.List&method=stop"]["get"]
+    assert {p["name"] for p in stop["parameters"]} >= {"taskid", "version"}
+    assert "folder_path" not in {p["name"] for p in stop["parameters"]}
+    assert validate_spec(result.spec)[0] == []
+
+
+def test_ordinary_query_parameters_stay_parameters(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("Search orders", 14)
+    b.line("GET /v1/orders?status=open&limit=10")
+    result = extract(b.save(tmp_path / "q.pdf"), ocr=False)
+    assert list(result.spec["paths"]) == ["/v1/orders"]
+    names = {p["name"] for p in result.spec["paths"]["/v1/orders"]["get"]["parameters"]}
+    assert names == {"status", "limit"}
+
+
+@pytest.mark.parametrize("text", ["Description:", "Response:", "Example:"])
+def test_label_lines_are_not_running_headers(tmp_path, text):
+    b = PdfBuilder()
+    for path in ["/a", "/b", "/c"]:
+        b.new_page()
+        b.line(f"GET {path}")
+        b.line(text)
+        b.line(f"Returns the {path[1:]} record and its owner.")
+        b.line("The record is cached for one minute.")
+        b.line("See the error codes chapter for failures.")
+    result = extract(b.save(tmp_path / "labels.pdf"), ocr=False)
+    assert all(text in body for body in result.sections.values())
+
+
+def test_wrapped_prose_does_not_switch_table_context(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("Get statistics", 14)
+    b.line("GET /v1/stats")
+    b.line("Request header parameters")
+    b.row("Parameter", "Mandatory", "Type", "Description")
+    b.row("X-Token", "No", "String", "Token. The value of X-")
+    b.line("Subject-Token in the response")
+    b.line("header is the user token.")
+    b.row("X-Sdk-Date", "No", "String", "Time when a request is sent.")
+    result = extract(b.save(tmp_path / "wrap.pdf"), ocr=False)
+    params = {p["name"]: p["in"] for p in result.spec["paths"]["/v1/stats"]["get"]["parameters"]}
+    assert params.get("X-Sdk-Date") == "header"
