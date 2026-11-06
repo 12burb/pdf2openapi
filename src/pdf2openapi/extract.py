@@ -84,6 +84,7 @@ class Section:
     before: str
     query: list[str] = field(default_factory=list)
     lines: list[tuple[int, str]] = field(default_factory=list)
+    rpc: dict[str, str] = field(default_factory=dict)
     method_guessed: bool = False
     depth: int | None = None
     closed: bool = False
@@ -145,6 +146,8 @@ def _running_lines(pages: list[list[str]]) -> set[str]:
         shape
         for shape, n in counts.items()
         if n >= 3
+        and not shape.endswith(":")
+        and ("#" in shape or len(shape.split()) > 1)
         and not ENDPOINT_RE.search(shape)
         and not _header_columns(shape)
         and not _heading_kind(shape)
@@ -170,6 +173,11 @@ URL_LABEL_LINE_RE = re.compile(
 )
 GUESSED_MARK = "   [method not stated]"
 MAX_SECTION_PAGES = 10
+RPC_KEYS = ("api", "service", "action", "method", "op", "operation", "cmd", "command", "function")
+QUERY_PAIR_RE = re.compile(r"[?&]([A-Za-z_][\w\-.]*)=([^&#\s]*)")
+QUERY_CONT_RE = re.compile(r"^[A-Za-z_][\w\-.]*=[^\s]*$")
+REQUEST_LABEL_RE = re.compile(r"(?i)^\s*request\s*:?\s*$")
+DESCRIPTION_LABEL_RE = re.compile(r"(?i)^\s*description\s*:?\s*$")
 PERMISSION_RE = re.compile(r"^[\w-]+:[\w-]+:?[\w-]*(?:\s+[\u221a\u00d7])?$")
 GENERIC_HEADING_RE = re.compile(
     r"(?i)^(?:web\s+)?(?:api\s+)?(?:specific\s+)?(?:business\s+)?(?:uri|url|endpoint|overview|introduction|description|"
@@ -392,6 +400,7 @@ def _heading_depth(line: str) -> int | None:
 def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
     sections: list[Section] = []
     headings: list[tuple[str, int]] = []
+    last_endpoint = -1
     for i, (page, line) in enumerate(lines):
         matches = list(ENDPOINT_RE.finditer(line))
         prev = lines[i - 1] if i else None
@@ -407,24 +416,34 @@ def _find_sections(lines: list[tuple[int, str]]) -> list[Section]:
             headings = []
         for m in matches:
             guessed = line.endswith(GUESSED_MARK)
-            sections.append(
-                Section(
-                    method=m.group(1),
-                    path=normalize_path(m.group(3)),
-                    host=m.group(2),
-                    page=page,
-                    inline=line[m.end() :].removesuffix(GUESSED_MARK),
-                    method_guessed=guessed,
-                    depth=depth,
-                    before=before,
-                    query=[
-                        k
-                        for k in re.findall(r"[?&]([A-Za-z_][\w\-.]*)=", m.group(4) or "")
-                        if not k.startswith("_")
-                    ],
-                )
+            query = m.group(4) or ""
+            if m.end() == len(line.rstrip()):
+                for _, nxt in lines[i + 1 : i + 4]:
+                    if not (query.endswith("&") and QUERY_CONT_RE.match(nxt.strip())):
+                        break
+                    query += nxt.strip()
+            query = re.sub(r"(?i)%3D", "=", re.sub(r"(?i)%26", "&", query))
+            pairs = QUERY_PAIR_RE.findall(query)
+            rpc = _rpc_discriminators(pairs)
+            sec = Section(
+                method=m.group(1),
+                path=normalize_path(m.group(3)) + _rpc_suffix(rpc),
+                host=m.group(2),
+                page=page,
+                inline="" if rpc else line[m.end() :].removesuffix(GUESSED_MARK),
+                method_guessed=guessed,
+                depth=depth,
+                before=before,
+                query=list(
+                    dict.fromkeys(k for k, _ in pairs if not k.startswith("_") and k not in rpc)
+                ),
+                rpc=rpc,
             )
+            if rpc and len(matches) == 1:
+                _take_request_block(sec, sections, lines[last_endpoint + 1 : i])
+            sections.append(sec)
         if matches:
+            last_endpoint = i
             continue
         depth = _heading_depth(line)
         if depth:
@@ -447,6 +466,53 @@ def _is_heading_like(line: str) -> bool:
     return 0 < len(line) <= 80 and not line.endswith(".") and not ENDPOINT_RE.search(line)
 
 
+def _rpc_discriminators(pairs: list[tuple[str, str]]) -> dict[str, str]:
+    """Literal api/method-style query values that pick the operation on a single RPC endpoint."""
+    found = {
+        k: v for k, v in pairs if k.lower() in RPC_KEYS and re.fullmatch(r"[A-Za-z][\w.\-]*", v)
+    }
+    return found if any(k.lower() != "api" or len(found) == 1 for k in found) else {}
+
+
+def _rpc_suffix(rpc: dict[str, str]) -> str:
+    return "?" + "&".join(f"{k}={v}" for k, v in rpc.items()) if rpc else ""
+
+
+def _take_request_block(
+    sec: Section, sections: list[Section], between: list[tuple[int, str]]
+) -> None:
+    """RPC docs often list a method's request parameters above its example call.
+
+    Move that block (from 'Description:' or 'Request:' down to the call) out of the previous
+    section and into this one.
+    """
+    start = next(
+        (k for k in range(len(between) - 1, -1, -1) if REQUEST_LABEL_RE.match(between[k][1])),
+        None,
+    )
+    if start is None:
+        return
+    cut = start
+    for k in range(start - 1, max(start - 6, -1), -1):
+        if DESCRIPTION_LABEL_RE.match(between[k][1]):
+            if k + 1 < start:
+                sec.inline = "   " + between[k + 1][1].strip()
+            cut = k
+            break
+    # The method's name heading (e.g. 'Method' / 'list') sits just above its description.
+    while cut > max(start - 8, 0) and len(between[cut - 1][1].split()) == 1:
+        cut -= 1
+    block = between[start:]
+    moved = set(between[cut:])
+    prev = sections[-1] if sections else None
+    if prev:
+        owned = len(prev.lines)
+        while owned and prev.lines[owned - 1] in moved:
+            owned -= 1
+        del prev.lines[owned:]
+    sec.lines.extend(block)
+
+
 def _clean_summary(text: str) -> str:
     text = re.sub(r"\.{3,}\s*\d*\s*$", "", text)
     text = NUMBERING_RE.sub("", text)
@@ -466,6 +532,8 @@ def _is_toc(section: Section) -> bool:
 def _heading_kind(line: str) -> str | None:
     stripped = NUMBERING_RE.sub("", line.strip()).rstrip(":")
     if len(stripped) > 40 or CELL_SPLIT_RE.search(stripped):
+        return None
+    if stripped[:1].islower() and len(stripped.split()) > 2:
         return None
     for pattern, kind in HEADINGS:
         if pattern.search(stripped):
@@ -488,6 +556,9 @@ def _header_columns(line: str) -> dict[str, int] | None:
     if "name" in cols and "type" in cols and len(cells) >= 2:
         cols["count"] = len(cells)
         return cols
+    if "name" in cols and "description" in cells and len(cells) >= 3:
+        # No type column: _parse_table_row looks for a type word in any cell.
+        return {**cols, "type": len(cells), "count": len(cells)}
     return None
 
 
@@ -504,10 +575,16 @@ def _parse_table_row(
     line: str, cols: dict[str, int]
 ) -> tuple[str, dict[str, Any], bool | None, str] | None:
     cells = _cells(line)
-    if len(cells) <= max(cols["name"], cols["type"]):
+    if len(cells) <= cols["name"]:
         return None
     name = cells[cols["name"]].strip("`")
-    prop = schema.parse_type(cells[cols["type"]])
+    prop = schema.parse_type(cells[cols["type"]]) if cols["type"] < len(cells) else None
+    if prop is None and NAME_RE.fullmatch(name):
+        # Wrapped description text can shift the type into a neighbouring cell.
+        for k, cell in enumerate(cells):
+            if k != cols["name"] and len(cell.split()) <= 2 and schema.parse_type(cell):
+                prop, cols = schema.parse_type(cell), {**cols, "type": k}
+                break
     if not NAME_RE.fullmatch(name) or prop is None:
         return None
     required = None
@@ -664,7 +741,8 @@ class _Builder:
                 columns = header
                 collecting_desc = False
                 continue
-            kind = _heading_kind(line)
+            wrapped = idx > 0 and lines[idx - 1].rstrip().endswith("-")
+            kind = None if wrapped else _heading_kind(line)
             parsed = None
             if not kind:
                 parsed = (_parse_table_row(line, columns) if columns else None) or (
@@ -703,9 +781,19 @@ class _Builder:
                 collecting_desc
                 and len(description) < 3
                 and not line.lstrip().startswith(("{", "[", "curl"))
+                and not QUERY_CONT_RE.match(line.strip())
+                and not REQUEST_LABEL_RE.match(line)
+                and len(line.split()) > 1
             ):
                 description.append(line.strip())
 
+        for name, value in sec.rpc.items():
+            params[("query", name)] = {
+                "name": name,
+                "in": "query",
+                "required": True,
+                "schema": {"type": "string", "enum": [value]},
+            }
         for name in sec.query:
             params.setdefault(
                 ("query", name), {"name": name, "in": "query", "schema": {"type": "string"}}
@@ -731,7 +819,9 @@ class _Builder:
                 request_example = value
 
         op: dict[str, Any] = {}
-        summary = _clean_summary(sec.inline) or self._summary_from_before(sec.before)
+        summary = _clean_summary(sec.inline) or (
+            " ".join(sec.rpc.values()) if sec.rpc else self._summary_from_before(sec.before)
+        )
         if not summary and sec.method_guessed:
             summary = _humanize_path(path)
         if summary:
@@ -777,7 +867,9 @@ class _Builder:
 
     @staticmethod
     def _location(context: str | None, name: str, method: str, path_params: list[str]) -> str:
-        if context in ("path", "query", "header", "body", "response"):
+        if context in ("query", "header", "body", "response") or (
+            context == "path" and name in path_params
+        ):
             return context
         if name in path_params:
             return "path"
