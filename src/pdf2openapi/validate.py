@@ -30,15 +30,23 @@ def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
         errors.append(f"{where}: {err.message}")
 
     warnings = []
+    inferred = []
     for path, item in (spec.get("paths") or {}).items():
         for method, op in (item or {}).items():
             if not isinstance(op, dict):
                 continue
             key = f"{method.upper()} {path}"
             if op.get("x-inferred-responses"):
-                warnings.append(f"{key}: no status codes in the docs; assumed 200")
+                inferred.append(key)
             if method in ("post", "put", "patch") and "requestBody" not in op:
                 warnings.append(f"{key}: no request body documented")
+    if len(inferred) > 3:
+        warnings.append(
+            f"{len(inferred)} endpoints have no status codes in the docs; assumed 200 "
+            f"(e.g. {inferred[0]})"
+        )
+    else:
+        warnings += [f"{key}: no status codes in the docs; assumed 200" for key in inferred]
     return errors, warnings
 
 

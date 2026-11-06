@@ -493,6 +493,43 @@ def _is_heading_like(line: str) -> bool:
     return 0 < len(line) <= 80 and not line.endswith(".") and not ENDPOINT_RE.search(line)
 
 
+FORM_PART_RE = re.compile(
+    r'content-disposition:\s*form-data;\s*name="([^"]+)"(;\s*filename=)?', re.IGNORECASE
+)
+
+
+def _multipart_fields(lines: list[str]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Fields of a raw multipart/form-data example, plus literal api/method values in it."""
+    props: dict[str, Any] = {}
+    rpc: dict[str, str] = {}
+    for idx, line in enumerate(lines):
+        m = FORM_PART_RE.search(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if m.group(2):
+            props[name] = {"type": "string", "format": "binary"}
+            continue
+        value = next(
+            (
+                v.strip()
+                for v in lines[idx + 1 : idx + 3]
+                if v.strip() and not v.lstrip("\\").startswith("--")
+            ),
+            "",
+        )
+        if value.lower() in ("true", "false"):
+            props[name] = {"type": "boolean", "example": value.lower() == "true"}
+        elif re.fullmatch(r"-?\d+", value):
+            props[name] = {"type": "integer", "example": int(value)}
+        else:
+            props[name] = {"type": "string", "example": value} if value else {"type": "string"}
+        if name.lower() in RPC_KEYS and re.fullmatch(r"[A-Za-z][\w.\-]*", value):
+            rpc[name] = value
+            props[name] = {"type": "string", "enum": [value]}
+    return props, rpc
+
+
 def _rpc_discriminators(pairs: list[tuple[str, str]]) -> dict[str, str]:
     """Literal api/method-style query values that pick the operation on a single RPC endpoint."""
     found = {
@@ -831,6 +868,11 @@ class _Builder:
                 {"name": name, "in": "path", "required": True, "schema": {"type": "string"}},
             )
 
+        form_fields, form_rpc = _multipart_fields(lines)
+        for name, prop in form_fields.items():
+            required = name in form_rpc or prop.get("format") == "binary"
+            schema.insert_property(body, name, prop, required)
+
         request_example = response_example = None
         for start, value in _json_blocks(lines):
             prior = [heading_at[k] for k in sorted(heading_at) if k <= start]
@@ -846,8 +888,9 @@ class _Builder:
                 request_example = value
 
         op: dict[str, Any] = {}
+        rpc = sec.rpc or form_rpc
         summary = _clean_summary(sec.inline) or (
-            " ".join(sec.rpc.values()) if sec.rpc else self._summary_from_before(sec.before)
+            " ".join(rpc.values()) if rpc else self._summary_from_before(sec.before)
         )
         if not summary and sec.method_guessed:
             summary = _humanize_path(path)
@@ -865,10 +908,8 @@ class _Builder:
             content: dict[str, Any] = {"schema": body_schema}
             if request_example is not None:
                 content["example"] = request_example
-            op["requestBody"] = {
-                "required": True,
-                "content": {"application/json": content},
-            }
+            media_type = "multipart/form-data" if form_fields else "application/json"
+            op["requestBody"] = {"required": True, "content": {media_type: content}}
 
         resp_schema = resp_fields
         if response_example is not None:

@@ -465,3 +465,36 @@ def test_ai_hint_flags_thin_operations():
     assert hint.startswith("2 of 3 endpoints look incomplete")
     assert "POST /orders" in hint and "GET /refunds" in hint
     assert ai_hint({"paths": {}}).startswith("no endpoints found")
+
+
+def test_multipart_example_becomes_form_body(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("Upload", 14)
+    b.line("Example:")
+    b.line("POST /webapi/entry.cgi")
+    b.line("Content-type: multipart/form-data, boundary=AaB03x")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="api"')
+    b.line("SYNO.FileStation.Upload")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="method"')
+    b.line("upload")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="version"')
+    b.line("2")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="overwrite"')
+    b.line("true")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="file"; filename="file1.txt"')
+    b.line("Content-Type: application/octet-stream")
+    b.line("--AaB03x--")
+    op = extract(b.save(tmp_path / "upload.pdf"), ocr=False).spec["paths"]["/webapi/entry.cgi"]
+    op = op["post"]
+    assert op["summary"] == "SYNO.FileStation.Upload upload"
+    form = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+    assert form["properties"]["api"] == {"type": "string", "enum": ["SYNO.FileStation.Upload"]}
+    assert form["properties"]["version"]["type"] == "integer"
+    assert form["properties"]["overwrite"]["type"] == "boolean"
+    assert form["properties"]["file"] == {"type": "string", "format": "binary"}
+    assert set(form["required"]) == {"api", "method", "file"}

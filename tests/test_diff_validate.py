@@ -231,3 +231,16 @@ def test_cli_extract_tip_only_without_ai(tmp_path, capsys):
     assert main(["extract", str(pdf_path), "-o", str(tmp_path / "t.yaml"), "--no-ocr"]) == 0
     err = capsys.readouterr().err
     assert "tip: 1 of 1 endpoints look incomplete" in err and "--provider ollama" in err
+
+
+def test_inferred_response_warnings_are_collapsed():
+    from pdf2openapi.validate import validate_spec
+
+    op = {"responses": {"200": {"description": "ok"}}, "x-inferred-responses": True}
+    spec = {"openapi": "3.0.3", "info": {"title": "t", "version": "1"}, "paths": {}}
+    spec["paths"] = {f"/p{i}": {"get": dict(op)} for i in range(5)}
+    assert validate_spec(spec)[1] == [
+        "5 endpoints have no status codes in the docs; assumed 200 (e.g. GET /p0)"
+    ]
+    spec["paths"] = {"/p0": {"get": dict(op)}}
+    assert validate_spec(spec)[1] == ["GET /p0: no status codes in the docs; assumed 200"]
