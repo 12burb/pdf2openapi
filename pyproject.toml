@@ -12,6 +12,9 @@ requires-python = ">=3.10"
 authors = [{ name = "12burb" }]
 keywords = ["openapi", "pdf", "swagger", "api", "mcp", "documentation"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
   "Topic :: Software Development :: Code Generators",
@@ -32,6 +35,8 @@ pdf2openapi = "pdf2openapi.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/12burb/pdf2openapi"
+Changelog = "https://github.com/12burb/pdf2openapi/blob/main/CHANGELOG.md"
+Issues = "https://github.com/12burb/pdf2openapi/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pdf2openapi"]
