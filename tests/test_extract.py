@@ -451,3 +451,17 @@ def test_ocr_converts_rgba_and_cmyk_images(cs, alpha):
     png = pdf._png_for_ocr(pix)
     out = pymupdf.Pixmap(png)
     assert (out.n, out.alpha) == (3, 0)
+
+
+def test_ai_hint_flags_thin_operations():
+    from pdf2openapi.extract import ai_hint
+
+    ok = {"summary": "List orders", "responses": {}}
+    spec = {"paths": {"/orders": {"get": ok}}}
+    assert ai_hint(spec) is None
+    spec["paths"]["/orders"]["post"] = {"summary": "Create order"}
+    spec["paths"]["/refunds"] = {"get": {}}
+    hint = ai_hint(spec)
+    assert hint.startswith("2 of 3 endpoints look incomplete")
+    assert "POST /orders" in hint and "GET /refunds" in hint
+    assert ai_hint({"paths": {}}).startswith("no endpoints found")

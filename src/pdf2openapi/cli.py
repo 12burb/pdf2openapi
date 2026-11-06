@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__, llm
 from .diff import diff_specs, load_spec
-from .extract import extract
+from .extract import ai_hint, extract
 from .output import dump
 from .validate import probe, validate_spec
 
@@ -44,6 +44,13 @@ def cmd_extract(args: argparse.Namespace) -> int:
     else:
         sys.stdout.write(text)
     _warn(result.warnings)
+    hint = None if args.ai or args.provider else ai_hint(result.spec)
+    if hint:
+        print(
+            f"tip: {hint} Re-run with --ai, or --provider ollama for a free local model "
+            "(no key needed).",
+            file=sys.stderr,
+        )
     return 0
 
 

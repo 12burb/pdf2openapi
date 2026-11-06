@@ -103,6 +103,33 @@ class ExtractResult:
     document: pdf.Document | None = None
 
 
+def incomplete_operations(spec: dict[str, Any]) -> list[str]:
+    """Operations the rule-based parser left thin: no summary, or a write with no inputs."""
+    thin = []
+    for path, item in spec.get("paths", {}).items():
+        for method, op in item.items():
+            inputs = [p for p in op.get("parameters", []) if p.get("in") != "path"]
+            no_inputs = method in ("post", "put", "patch") and not inputs
+            if not op.get("summary") or (no_inputs and "requestBody" not in op):
+                thin.append(f"{method.upper()} {path}")
+    return thin
+
+
+def ai_hint(spec: dict[str, Any]) -> str | None:
+    """Say when AI refinement is likely to help, judged from the rule-based result alone."""
+    total = sum(len(item) for item in spec.get("paths", {}).values())
+    if not total:
+        return "no endpoints found. If the PDF describes them in sentences, AI refinement can help."
+    thin = incomplete_operations(spec)
+    if not thin:
+        return None
+    shown = ", ".join(thin[:3]) + (", ..." if len(thin) > 3 else "")
+    return (
+        f"{len(thin)} of {total} endpoints look incomplete (no summary or no request fields): "
+        f"{shown}. AI refinement can fill these in."
+    )
+
+
 def normalize_path(raw: str) -> str:
     path = raw.split("?")[0].split("#")[0].rstrip(".,:;")
     path = re.sub(r"\{\{\s*(\w+)\s*\}\}", r"{\1}", path)
