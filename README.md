@@ -17,10 +17,12 @@ retyping it all into Postman and only notice changes when production breaks.
 ## Install
 
 ```bash
-pip install git+https://github.com/12burb/pdf2openapi
+pip install git+https://github.com/12burb/pdf2openapi@v0.1.0   # or omit @v0.1.0 for the latest
 # optional, to read screenshots and scanned pages:
 sudo apt install tesseract-ocr   # macOS: brew install tesseract
 ```
+
+Or run it without installing: `uvx --from git+https://github.com/12burb/pdf2openapi pdf2openapi extract vendor-api.pdf`.
 
 ## Use
 
