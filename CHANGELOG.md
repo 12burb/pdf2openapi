@@ -11,6 +11,8 @@ First release.
 - Every operation cites its source pages in `x-source-pages`.
 - Query-RPC APIs (`/entry.cgi?api=X&method=Y`, as in Synology's docs) become one operation per call.
 - Endpoints whose method is not stated are guessed and marked `x-method-guessed`.
+- Raw `multipart/form-data` examples become a multipart request body with typed fields and a
+  binary `file` field.
 - A `tip:` line names endpoints that came out incomplete, judged without AI.
 
 ### Optional AI refinement

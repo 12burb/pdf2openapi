@@ -15,7 +15,7 @@ No API token is needed; PyPI trusts the GitHub workflow directly.
 
 ## Each release
 
-1. Set `version` in `pyproject.toml` and `__version__` in `src/pdf2openapi/__init__.py`.
+1. Set `version` in `pyproject.toml` (`__version__` is read from the installed package).
 2. Move the `unreleased` heading in `CHANGELOG.md` to the version and date.
 3. Merge to `main`, then create a GitHub release with tag `v<version>` (e.g. `v0.1.0`).
    Publishing the release runs `.github/workflows/release.yml`, which builds and uploads to PyPI.
