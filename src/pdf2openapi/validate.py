@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 from openapi_spec_validator import OpenAPIV30SpecValidator, OpenAPIV31SpecValidator
@@ -72,8 +73,12 @@ def probe(
                         ProbeResult(key, None, "skipped (path is not relative to base URL)")
                     )
                     continue
+                given = {k for k, _ in parse_qsl(urlparse(path).query)}
                 needs_input = "{" in path or any(
-                    p.get("required") for p in op.get("parameters") or [] if p.get("in") != "header"
+                    p.get("required")
+                    for p in op.get("parameters") or []
+                    if p.get("in") not in ("header", "cookie")
+                    and not (p.get("in") == "query" and p.get("name") in given)
                 )
                 if needs_input:
                     results.append(ProbeResult(key, None, "skipped (needs path or query values)"))

@@ -205,3 +205,10 @@ def test_stray_ai_path_params_become_body_fields(vendor_pdf):
     from pdf2openapi.validate import validate_spec
 
     assert validate_spec(result.spec)[0] == []
+
+
+def test_clean_operation_drops_invalid_status_codes():
+    cleaned = llm._clean_operation(
+        {"responses": {"200 OK": {"description": "x"}, "201": {}, "4XX": {}, "default": {}}}
+    )
+    assert set(cleaned["responses"]) == {"201", "4XX", "default"}

@@ -77,7 +77,8 @@ pdf2openapi extract vendor-api.pdf --ai                     # uses whichever key
 pdf2openapi extract vendor-api.pdf --provider ollama --model llama3.1
 ```
 
-`PDF2OPENAPI_PROVIDER` and `PDF2OPENAPI_MODEL` set defaults. `PDF2OPENAPI_TIMEOUT` sets the per-request
+`PDF2OPENAPI_PROVIDER` and `PDF2OPENAPI_MODEL` set defaults; `OLLAMA_HOST` points at a remote
+Ollama (default `http://localhost:11434`). `PDF2OPENAPI_TIMEOUT` sets the per-request
 timeout in seconds (default 180, or 900 for Ollama). On a CPU-only machine a local model takes
 roughly 15-60 seconds per endpoint, so start with a small model such as `qwen2.5:3b`.
 

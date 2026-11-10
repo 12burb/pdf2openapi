@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import yaml
 from conftest import PdfBuilder
 
@@ -244,3 +245,64 @@ def test_inferred_response_warnings_are_collapsed():
     ]
     spec["paths"] = {"/p0": {"get": dict(op)}}
     assert validate_spec(spec)[1] == ["GET /p0: no status codes in the docs; assumed 200"]
+
+
+def test_cli_reports_unreadable_inputs(tmp_path, capsys):
+    fake_pdf = tmp_path / "page.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.7\ngarbage")
+    assert main(["extract", str(fake_pdf), "--no-ocr"]) == 2
+    assert "cannot read" in capsys.readouterr().err
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("a: [1,\n")
+    assert main(["validate", str(bad)]) == 2
+    assert "not valid YAML" in capsys.readouterr().err
+    garbage = tmp_path / "x.bin"
+    garbage.write_bytes(b"\xcd\xff\x00")
+    assert main(["validate", str(garbage)]) == 2
+    assert "neither a PDF nor" in capsys.readouterr().err
+    assert main(["validate", str(tmp_path)]) == 2
+    assert "error:" in capsys.readouterr().err
+    assert main(["extract", str(tmp_path / "missing.pdf")]) == 2
+    assert "missing.pdf" in capsys.readouterr().err
+
+
+def test_fetch_errors_name_the_original_url():
+    from pdf2openapi.diff import fetch_url
+
+    def refused(request):
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(ValueError, match="could not fetch https://vendor.test/a.yaml"):
+        fetch_url("https://vendor.test/a.yaml", transport=httpx.MockTransport(refused))
+    with pytest.raises(ValueError, match="https://vendor.test/a.yaml returned HTTP 404"):
+        fetch_url(
+            "https://vendor.test/a.yaml",
+            transport=httpx.MockTransport(lambda r: httpx.Response(404)),
+        )
+
+
+def test_probe_calls_rpc_paths_whose_query_is_in_the_path():
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "t", "version": "1"},
+        "paths": {
+            "/entry.cgi?api=SYNO.Info&method=query": {
+                "get": {
+                    "parameters": [
+                        {"name": "api", "in": "query", "required": True, "schema": {}},
+                        {"name": "method", "in": "query", "required": True, "schema": {}},
+                    ],
+                    "responses": {"200": {"description": "ok"}},
+                }
+            }
+        },
+    }
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200)
+
+    results = probe(spec, "https://nas.test/webapi", transport=httpx.MockTransport(handler))
+    assert seen == ["https://nas.test/webapi/entry.cgi?api=SYNO.Info&method=query"]
+    assert results[0].verdict == "ok"

@@ -496,6 +496,7 @@ def _is_heading_like(line: str) -> bool:
 FORM_PART_RE = re.compile(
     r'content-disposition:\s*form-data;\s*name="([^"]+)"(;\s*filename=)?', re.IGNORECASE
 )
+MULTIPART_LINE_RE = re.compile(r"(?i)^\s*\\?(?:--|content-(?:type|disposition|length)\b)")
 
 
 def _multipart_fields(lines: list[str]) -> tuple[dict[str, Any], dict[str, str]]:
@@ -847,6 +848,7 @@ class _Builder:
                 and not line.lstrip().startswith(("{", "[", "curl"))
                 and not QUERY_CONT_RE.match(line.strip())
                 and not REQUEST_LABEL_RE.match(line)
+                and not MULTIPART_LINE_RE.match(line)
                 and len(line.split()) > 1
             ):
                 description.append(line.strip())
@@ -871,6 +873,11 @@ class _Builder:
         form_fields, form_rpc = _multipart_fields(lines)
         for name, prop in form_fields.items():
             required = name in form_rpc or prop.get("format") == "binary"
+            existing = body.get("properties", {}).get(name)
+            if existing:
+                for k, v in prop.items():
+                    existing.setdefault(k, v)
+                prop = existing
             schema.insert_property(body, name, prop, required)
 
         request_example = response_example = None

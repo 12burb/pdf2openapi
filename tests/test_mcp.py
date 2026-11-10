@@ -84,3 +84,16 @@ def test_use_ai_falls_back_to_client_sampling(vendor_pdf, monkeypatch):
     assert op["summary"] == "From the client model"
     assert op["x-refined-by"] == "mcp-client"
     assert len(calls) == 2
+
+
+def test_extract_refuses_non_spec_output_path(tmp_path, vendor_pdf):
+    async def run():
+        async with create_connected_server_and_client_session(server) as client:
+            return await client.call_tool(
+                "extract_openapi",
+                {"pdf_path": str(vendor_pdf), "output_path": str(tmp_path / ".bashrc")},
+            )
+
+    result = asyncio.run(run())
+    assert result.isError and "must end in .yaml" in result.content[0].text
+    assert not (tmp_path / ".bashrc").exists()

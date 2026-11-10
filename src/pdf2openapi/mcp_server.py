@@ -19,6 +19,7 @@ from .output import dump
 from .validate import validate_spec
 
 MAX_READ_CHARS = 60000
+SPEC_SUFFIXES = (".yaml", ".yml", ".json")
 
 server = FastMCP(
     "pdf2openapi",
@@ -76,6 +77,8 @@ async def extract_openapi(
     the result with a model: the server's configured key if any, otherwise your own model
     via MCP sampling. Set output_path to also write the spec to a file.
     """
+    if output_path and Path(output_path).suffix.lower() not in SPEC_SUFFIXES:
+        raise ValueError("output_path must end in .yaml, .yml or .json")
     result = extract_document(pdf.load(pdf_path))
     if use_ai:
         provider = None

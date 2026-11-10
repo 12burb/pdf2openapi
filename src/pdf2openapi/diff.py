@@ -135,6 +135,7 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
 
     Credentials in the URL are only sent to that URL's own origin, never to redirect targets.
     """
+    original = url
     parsed = urlparse(url)
     home = _origin(url)
     auth = None
@@ -146,7 +147,10 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
             request = client.build_request("GET", target, headers=headers, extensions=extensions)
             if auth and _origin(url) == home:
                 request = next(auth.auth_flow(request))
-            resp = client.send(request, stream=True)
+            try:
+                resp = client.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                raise ValueError(f"could not fetch {original}: {exc}") from exc
             try:
                 if resp.is_redirect:
                     location = urljoin(url, resp.headers["location"])
@@ -156,7 +160,8 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
                         .geturl()
                     )
                     continue
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    raise ValueError(f"{original} returned HTTP {resp.status_code}")
                 chunks, size = [], 0
                 for chunk in resp.iter_bytes():
                     size += len(chunk)
@@ -170,7 +175,11 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
 
 
 def _parse_spec_text(text: str, source: str, is_json: bool) -> dict[str, Any]:
-    data = json.loads(text) if is_json else yaml.safe_load(text)
+    try:
+        data = json.loads(text) if is_json else yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as exc:
+        kind = "JSON" if is_json else "YAML"
+        raise ValueError(f"{source} is not valid {kind}: {exc}") from exc
     if not isinstance(data, dict) or "paths" not in data:
         raise ValueError(f"{source} is not an OpenAPI document")
     return data
@@ -187,14 +196,21 @@ def load_spec(
                 path = Path(tmp) / "download.pdf"
                 path.write_bytes(content)
                 return extract(path, ocr=ocr).spec
-        text = content.decode("utf-8")
+        text = _decode(content, source)
         return _parse_spec_text(text, source, text.lstrip().startswith(("{", "[")))
     path = Path(source)
     with open(path, "rb") as fh:
         head = fh.read(5)
     if head == b"%PDF-":
         return extract(path, ocr=ocr).spec
-    return _parse_spec_text(path.read_text(encoding="utf-8"), source, path.suffix == ".json")
+    return _parse_spec_text(_decode(path.read_bytes(), source), source, path.suffix == ".json")
+
+
+def _decode(content: bytes, source: str) -> str:
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{source} is neither a PDF nor a text (YAML/JSON) file") from exc
 
 
 def _operations(spec: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:

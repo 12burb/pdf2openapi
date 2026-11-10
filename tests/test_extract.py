@@ -498,3 +498,19 @@ def test_multipart_example_becomes_form_body(tmp_path):
     assert form["properties"]["overwrite"]["type"] == "boolean"
     assert form["properties"]["file"] == {"type": "string", "format": "binary"}
     assert set(form["required"]) == {"api", "method", "file"}
+
+
+def test_multipart_lines_are_not_a_description(tmp_path):
+    b = PdfBuilder().new_page()
+    b.line("POST /upload")
+    b.line("Content-type: multipart/form-data, boundary=AaB03x")
+    b.line("--AaB03x")
+    b.line('content-disposition: form-data; name="file"; filename="a.txt"')
+    b.line("Content-Type: application/octet-stream")
+    b.line("--AaB03x--")
+    from pdf2openapi.extract import extract as run_extract
+
+    spec = run_extract(b.save(tmp_path / "m.pdf"), ocr=False).spec
+    op = spec["paths"]["/upload"]["post"]
+    assert "description" not in op
+    assert op["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"]["file"]
