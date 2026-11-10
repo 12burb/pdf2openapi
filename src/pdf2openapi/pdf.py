@@ -158,7 +158,13 @@ def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
 def load(path: str | Path, ocr: bool = True) -> Document:
     path = str(path)
     use_ocr = ocr and ocr_available()
-    with pymupdf.open(path) as doc:
+    try:
+        opened = pymupdf.open(path)
+    except pymupdf.FileNotFoundError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+    except (pymupdf.FileDataError, RuntimeError) as exc:
+        raise ValueError(f"cannot read {path} as a PDF: {exc}") from exc
+    with opened as doc:
         title = (doc.metadata or {}).get("title") or ""
         result = Document(path=path, title=title.strip())
         for index, page in enumerate(doc):

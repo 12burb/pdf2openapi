@@ -22,6 +22,7 @@ MAX_EXCERPT_CHARS = 12000
 DEFAULT_MODELS = {"openai": "gpt-4o-mini", "gemini": "gemini-2.5-flash", "ollama": "llama3.1"}
 BODYLESS_METHODS = ("get", "head", "delete", "options")
 ALLOWED_KEYS = ("summary", "description", "parameters", "requestBody", "responses")
+STATUS_CODE_RE = re.compile(r"[1-5](?:\d{2}|XX)|default")
 
 
 class ProviderError(RuntimeError):
@@ -271,7 +272,7 @@ def _clean_operation(reply: dict[str, Any], method: str = "post") -> dict[str, A
     if isinstance(responses, dict) and responses:
         cleaned = {}
         for code, resp in responses.items():
-            if isinstance(resp, dict):
+            if isinstance(resp, dict) and STATUS_CODE_RE.fullmatch(str(code)):
                 resp.setdefault("description", "Response")
                 cleaned[str(code)] = resp
         if cleaned:

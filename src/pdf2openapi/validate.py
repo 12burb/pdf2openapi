@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 from openapi_spec_validator import OpenAPIV30SpecValidator, OpenAPIV31SpecValidator
@@ -30,15 +31,23 @@ def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
         errors.append(f"{where}: {err.message}")
 
     warnings = []
+    inferred = []
     for path, item in (spec.get("paths") or {}).items():
         for method, op in (item or {}).items():
             if not isinstance(op, dict):
                 continue
             key = f"{method.upper()} {path}"
             if op.get("x-inferred-responses"):
-                warnings.append(f"{key}: no status codes in the docs; assumed 200")
+                inferred.append(key)
             if method in ("post", "put", "patch") and "requestBody" not in op:
                 warnings.append(f"{key}: no request body documented")
+    if len(inferred) > 3:
+        warnings.append(
+            f"{len(inferred)} endpoints have no status codes in the docs; assumed 200 "
+            f"(e.g. {inferred[0]})"
+        )
+    else:
+        warnings += [f"{key}: no status codes in the docs; assumed 200" for key in inferred]
     return errors, warnings
 
 
@@ -64,8 +73,12 @@ def probe(
                         ProbeResult(key, None, "skipped (path is not relative to base URL)")
                     )
                     continue
+                given = {k for k, _ in parse_qsl(urlparse(path).query)}
                 needs_input = "{" in path or any(
-                    p.get("required") for p in op.get("parameters") or [] if p.get("in") != "header"
+                    p.get("required")
+                    for p in op.get("parameters") or []
+                    if p.get("in") not in ("header", "cookie")
+                    and not (p.get("in") == "query" and p.get("name") in given)
                 )
                 if needs_input:
                     results.append(ProbeResult(key, None, "skipped (needs path or query values)"))
