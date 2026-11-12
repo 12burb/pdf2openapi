@@ -1,0 +1,43 @@
+name: pages
+# Publishes web/ plus the package wheel to GitHub Pages. The page runs the parser in the
+# visitor's browser (Pyodide); no server, no uploads, no hosting cost.
+on:
+  push:
+    branches: [main]
+    paths: [web/**, src/**, pyproject.toml, .github/workflows/pages.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Assemble the site
+        run: |
+          mkdir site && cp web/* site/ && cp dist/*.whl site/
+          wheel=$(basename dist/*.whl)
+          echo "{\"wheel\": \"$wheel\"}" > site/wheel.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

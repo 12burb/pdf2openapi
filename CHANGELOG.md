@@ -29,6 +29,10 @@ First release.
 - URL fetching refuses private addresses (including via redirects and DNS) unless
   `PDF2OPENAPI_ALLOW_PRIVATE_URLS=1`.
 
+### Browser
+- A static page (GitHub Pages) runs the parser in the browser with pdf.js and Pyodide: extract
+  and diff without uploading anything. No OCR or AI there.
+
 ### MCP
 - `pdf2openapi mcp` runs a stdio MCP server with `extract_openapi`, `read_pdf_pages`,
   `diff_api_docs` and `validate_openapi`. With `use_ai=true` and no key, it uses the client's

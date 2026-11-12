@@ -5,10 +5,14 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pymupdf
+try:
+    import pymupdf
+except ImportError:  # the browser build (Pyodide) gets words from pdf.js instead
+    pymupdf = None
 
 MIN_IMAGE_WIDTH = 150
 MIN_IMAGE_HEIGHT = 40
@@ -52,11 +56,16 @@ def _ocr_png(png: bytes) -> str:
 
 
 def _page_lines(page: pymupdf.Page) -> str:
+    return lines_from_words(page.get_text("words"))
+
+
+def lines_from_words(words: Sequence[Sequence]) -> str:
     """Rebuild visual lines from word boxes so table rows stay on one line.
 
-    Wide horizontal gaps become three spaces, which the extractor treats as a column break.
+    Each word is (x0, y0, x1, y1, text, ...) in points with a top-left origin, as PyMuPDF's
+    get_text("words") returns them. Wide horizontal gaps become three spaces, which the
+    extractor treats as a column break.
     """
-    words = page.get_text("words")
     rows: list[list] = []
     for w in sorted(words, key=lambda w: ((w[1] + w[3]) / 2, w[0])):
         mid = (w[1] + w[3]) / 2
@@ -157,6 +166,8 @@ def _ocr_images(doc: pymupdf.Document, page: pymupdf.Page) -> str:
 
 def load(path: str | Path, ocr: bool = True) -> Document:
     path = str(path)
+    if pymupdf is None:
+        raise RuntimeError("PyMuPDF is not installed; cannot read PDF files")
     use_ocr = ocr and ocr_available()
     try:
         opened = pymupdf.open(path)

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdf2openapi: vendor PDF API docs to OpenAPI, in your browser</title>
+<meta name="description" content="Turn a vendor's PDF API documentation into an OpenAPI spec. Runs entirely in your browser; the PDF never leaves your computer.">
+<style>
+  :root { --fg: #1b1f23; --muted: #57606a; --bg: #fff; --line: #d0d7de; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e6edf3; --muted: #9da7b3; --bg: #0d1117; --line: #30363d; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .badge { display: inline-block; font-size: .8rem; padding: 2px 8px; border: 1px solid var(--ok); color: var(--ok); border-radius: 999px; margin-left: 8px; vertical-align: middle; }
+  .drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 32px; text-align: center; cursor: pointer; transition: border-color .15s; }
+  .drop.over, .drop:hover { border-color: var(--accent); }
+  .drop input { display: none; }
+  .drop small { display: block; color: var(--muted); margin-top: 6px; }
+  #status { margin: 14px 0; color: var(--muted); min-height: 1.5em; }
+  #status.err { color: var(--bad); }
+  section { display: none; margin-top: 24px; }
+  section.show { display: block; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .bar .grow { flex: 1; }
+  button, select { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  textarea, pre { width: 100%; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: transparent; color: var(--fg); white-space: pre; overflow: auto; }
+  textarea { height: 420px; resize: vertical; }
+  .note { padding: 10px 12px; border-left: 3px solid var(--warn); margin: 8px 0; font-size: .95rem; }
+  .note.tip { border-color: var(--accent); }
+  ul.warn { margin: 6px 0 0; padding-left: 20px; font-size: .9rem; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); }
+  footer { margin-top: 48px; font-size: .9rem; color: var(--muted); }
+  a { color: var(--accent); }
+  .count { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pdf2openapi <span class="badge">runs in your browser, nothing uploaded</span></h1>
+  <p class="sub">Drop a vendor's PDF API documentation. Get an OpenAPI 3.0 spec you can import into Postman, Insomnia or Bruno, or feed to a code generator. The PDF is read by your browser and never sent anywhere; close the tab and it is gone.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept="application/pdf,.pdf">
+    <strong>Drop a PDF here or click to choose</strong>
+    <small>No account, no API key, no AI. Rule-based parsing, with page citations for every endpoint.</small>
+  </label>
+  <div id="status">Loading the Python runtime (about 12 MB, cached after the first visit)...</div>
+
+  <section id="result">
+    <div class="bar">
+      <span class="grow"><span class="count" id="count"></span> endpoints found in <span id="name"></span></span>
+      <select id="format"><option value="yaml">YAML</option><option value="json">JSON</option></select>
+      <button id="copy">Copy</button>
+      <button id="download" class="primary">Download</button>
+    </div>
+    <div id="tip" class="note tip" hidden></div>
+    <details id="warnings" hidden><summary></summary><ul class="warn"></ul></details>
+    <textarea id="out" readonly spellcheck="false"></textarea>
+  </section>
+
+  <section id="diffsec">
+    <h2 style="font-size:1.1rem;margin:0 0 6px">Did the vendor change something?</h2>
+    <p class="sub" style="margin-bottom:10px">Drop the previous version of the PDF (or an older spec exported from here) to see added, removed and changed endpoints, with breaking changes flagged.</p>
+    <label class="drop" id="drop2">
+      <input type="file" id="file2" accept="application/pdf,.pdf,.yaml,.yml,.json">
+      <strong>Drop the older PDF or spec to compare</strong>
+    </label>
+    <pre id="diffout" hidden></pre>
+  </section>
+
+  <footer>
+    Open source (MIT): <a href="https://github.com/12burb/pdf2openapi">github.com/12burb/pdf2openapi</a>.
+    The command-line version adds OCR for screenshots, URL watching for CI, and optional AI refinement with your own model.
+    Scanned PDFs (images only) need the CLI with Tesseract installed.
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

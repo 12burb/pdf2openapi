@@ -14,6 +14,13 @@ retyping it all into Postman and only notice changes when production breaks.
   of the MCP client you are already using (Claude, Cursor, and others).
 - **Cites its sources.** Every operation has `x-source-pages` so you can check it.
 
+## Try it in your browser
+
+https://12burb.github.io/pdf2openapi/ runs the same parser inside your browser (via Pyodide and
+pdf.js). Drop a PDF, get the spec, compare it with the previous version. Nothing is uploaded and
+nothing is stored: there is no server behind the page. The browser version has no OCR and no AI
+step; for those, install the CLI.
+
 ## Install
 
 ```bash
