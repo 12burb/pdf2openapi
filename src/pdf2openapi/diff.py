@@ -10,14 +10,16 @@ import socket
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urljoin, urlparse
 
-import httpx
 import yaml
 
 from . import schema
 from .extract import extract
+
+if TYPE_CHECKING:
+    import httpx
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
@@ -135,6 +137,8 @@ def fetch_url(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
 
     Credentials in the URL are only sent to that URL's own origin, never to redirect targets.
     """
+    import httpx
+
     original = url
     parsed = urlparse(url)
     home = _origin(url)
