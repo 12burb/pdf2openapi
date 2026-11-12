@@ -29,6 +29,8 @@ jobs:
           wheel=$(basename dist/*.whl)
           echo "{\"wheel\": \"$wheel\"}" > site/wheel.json
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true  # turn Pages on for the repo if it is not yet
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
